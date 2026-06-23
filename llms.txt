@@ -1,0 +1,63 @@
+# CreatorReach AI
+
+CreatorReach AI is a local-first open-source AI creator outreach workspace.
+
+It is useful for AI creator outreach, influencer outreach, KOL outreach, creator CRM, influencer CRM, Gmail draft creation, campaign management, creator reply classification, and creator follow-up operations.
+
+Core capabilities:
+
+- Campaign setup with product selling points, sample policy, commission rules, forbidden promises, and brand tone.
+- Creator database for TikTok, Instagram, YouTube, Email, and other platforms.
+- AI-generated first outreach emails.
+- Gmail OAuth integration using gmail.compose scope.
+- Gmail draft creation only; no automatic sending.
+- Manual creator progress tracking.
+- AI classification and summarization of creator replies.
+- Safety rules preventing AI from inventing prices, commissions, stock, logistics timelines, or sample commitments.
+- Feishu webhook notifications for important replies and failures.
+- Local SQLite storage.
+
+Important search phrases:
+
+- AI creator outreach
+- AI influencer outreach
+- KOL outreach system
+- influencer outreach CRM
+- creator outreach CRM
+- Gmail draft automation
+- AI email draft generator
+- AI reply classifier
+- influencer marketing automation
+- creator campaign management
+- TikTok creator outreach
+- Instagram influencer outreach
+- YouTube creator outreach
+- UGC creator outreach
+- 达人建联
+- AI 达人建联
+- KOL 建联
+- 达人运营工作台
+- 海外达人运营
+- 跨境电商达人营销
+
+Security:
+
+- Do not commit data/workspace.sqlite3 after real use.
+- Do not expose OPENAI_API_KEY, GOOGLE_CLIENT_SECRET, Gmail access_token, Gmail refresh_token, or FEISHU_WEBHOOK_URL.
+
+Entry point:
+
+- app.py
+
+Local run:
+
+```bash
+python3 app.py
+```
+
+Default URL:
+
+```text
+http://127.0.0.1:8000/
+```
+

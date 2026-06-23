@@ -1,0 +1,30 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local database and runtime data
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+*.sqlite
+*.sqlite3
+*.db
+
+# Python caches
+__pycache__/
+.pycache/
+.pycache_check/
+*.pyc
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs and temporary artifacts
+*.log
+tmp/
+temp/
+

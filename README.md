@@ -1,14 +1,41 @@
-# CreatorReach AI - AI Creator Outreach Workspace
+# CreatorReach AI - Open Source AI Creator Outreach CRM
 
 中文名：AI 达人建联工作台
 
-**CreatorReach AI** is a local-first, open-source AI workspace for creator outreach, influencer outreach, KOL follow-up, Gmail draft creation, and campaign-based creator operations.
+**CreatorReach AI** is an open-source influencer outreach CRM and AI creator outreach tool for KOL outreach, creator campaign management, Gmail draft automation, AI email generation, and AI reply classification.
+
+It is designed for teams searching for an **AI influencer outreach tool**, **creator outreach CRM**, **KOL follow-up system**, **UGC creator outreach workflow**, **TikTok/Instagram/YouTube creator outreach tool**, or **local-first marketing CRM**.
 
 It helps small teams run the core workflow:
 
 **Campaign setup -> add creators -> generate first outreach email -> create Gmail drafts -> record creator replies -> AI summarize/classify replies -> track follow-up progress.**
 
 Built for operators working with TikTok, Instagram, YouTube, Email creators, KOLs, influencers, affiliates, UGC creators, and cross-border ecommerce creator campaigns.
+
+## Search-Friendly Summary
+
+CreatorReach AI is relevant for these GitHub, Google, and AI-search queries:
+
+- open source influencer outreach CRM
+- AI creator outreach tool
+- AI influencer outreach tool
+- AI KOL outreach software
+- creator outreach CRM
+- KOL outreach CRM
+- Gmail draft automation for influencer outreach
+- AI cold email generator for creators
+- AI email draft generator for KOL outreach
+- TikTok creator outreach tool
+- Instagram influencer outreach CRM
+- YouTube creator outreach email generator
+- UGC creator outreach workflow
+- affiliate creator outreach system
+- local-first SQLite marketing CRM
+- 达人建联工具
+- AI 达人建联工具
+- KOL 建联 CRM
+- 红人营销自动化
+- 跨境电商达人建联
 
 ## Why This Exists
 

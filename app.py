@@ -313,6 +313,15 @@ def init_db():
                 notes TEXT,
                 preferred_language TEXT DEFAULT 'English',
                 personalization_hook TEXT,
+                country TEXT,
+                city TEXT,
+                followers INTEGER,
+                content_tags TEXT,
+                audience_country TEXT,
+                evidence_url TEXT,
+                observed_at TEXT,
+                competitor_conflict INTEGER DEFAULT 0,
+                screening_status TEXT DEFAULT 'unverified',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -488,6 +497,14 @@ def migrate_schema(conn):
     add_column_if_missing(conn, "creators", "gmail_error", "TEXT")
     add_column_if_missing(conn, "creators", "preferred_language", "TEXT DEFAULT 'English'")
     add_column_if_missing(conn, "creators", "personalization_hook", "TEXT")
+    for column, definition in (
+        ("country", "TEXT"), ("city", "TEXT"), ("followers", "INTEGER"),
+        ("content_tags", "TEXT"), ("audience_country", "TEXT"),
+        ("evidence_url", "TEXT"), ("observed_at", "TEXT"),
+        ("competitor_conflict", "INTEGER DEFAULT 0"),
+        ("screening_status", "TEXT DEFAULT 'unverified'"),
+    ):
+        add_column_if_missing(conn, "creators", column, definition)
     add_column_if_missing(conn, "email_logs", "creator_id", "INTEGER")
     conn.execute(
         """
@@ -532,6 +549,7 @@ def nav_active(title, label):
         "错误日志": "错误日志",
         "达人跟进中心": "达人数据库",
         "Gmail 草稿": "Gmail 草稿",
+        "达人筛选": "达人筛选",
     }
     return " active" if mapping.get(title, title) == label else ""
 
@@ -539,6 +557,7 @@ def nav_active(title, label):
 def layout(title, body, extra_head=""):
     nav_items = [
         ("今日工作台", "/", "总览"),
+        ("达人筛选", "/screening", "候选筛选"),
         ("达人数据库", "/creators", "达人记录"),
         ("Gmail 草稿", "/gmail", "邮件草稿"),
         ("错误日志", "/errors", "异常处理"),
@@ -3383,6 +3402,142 @@ def gmail_page():
     return layout("Gmail 草稿", body)
 
 
+SCREENING_COUNTRIES = {"SA": "沙特", "AE": "阿联酋", "OTHER": "其他", "": "未核验"}
+SCREENING_STATUSES = {
+    "unverified": "待核验",
+    "verified": "已核验",
+    "excluded": "不适配",
+}
+
+
+def parse_followers(value):
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not value.isdecimal() or len(value) > 9:
+        raise ValueError("粉丝数必须是非负整数")
+    return int(value)
+
+
+def screening_page(query):
+    country = query.get("country", ["SA"])[0]
+    platform = query.get("platform", [""])[0]
+    minimum = query.get("min", ["100"])[0]
+    maximum = query.get("max", ["1000"])[0]
+    tag = (query.get("tag", [""])[0] or "").strip()[:80]
+    verification = query.get("verification", ["verified"])[0]
+    no_conflict = query.get("no_conflict", ["1"])[0] == "1"
+    try:
+        min_followers = parse_followers(minimum)
+        max_followers = parse_followers(maximum)
+        if min_followers is not None and max_followers is not None and min_followers > max_followers:
+            raise ValueError("最低粉丝数不能超过最高粉丝数")
+        error = ""
+    except ValueError as exc:
+        min_followers = max_followers = None
+        error = str(exc)
+    where, params = [], []
+    if country in SCREENING_COUNTRIES:
+        if country:
+            where.append("c.country = ?")
+            params.append(country)
+    if platform in PLATFORMS:
+        where.append("c.platform = ?")
+        params.append(platform)
+    if min_followers is not None:
+        where.append("c.followers >= ?")
+        params.append(min_followers)
+    if max_followers is not None:
+        where.append("c.followers <= ?")
+        params.append(max_followers)
+    if tag:
+        where.append("c.content_tags LIKE ?")
+        params.append(f"%{tag}%")
+    if verification in SCREENING_STATUSES:
+        where.append("c.screening_status = ?")
+        params.append(verification)
+    if no_conflict:
+        where.append("COALESCE(c.competitor_conflict, 0) = 0")
+    clause = "WHERE " + " AND ".join(where) if where else ""
+    with db() as conn:
+        rows = conn.execute(
+            f"""SELECT c.*, ca.name AS campaign_name FROM creators c
+            LEFT JOIN campaigns ca ON ca.id = c.campaign_id
+            {clause} ORDER BY c.followers ASC, c.updated_at DESC LIMIT 300""",
+            params,
+        ).fetchall()
+    campaigns = list_campaigns()
+    campaign_options = "".join(option_html(row["id"], row["name"], "") for row in campaigns)
+    countries = option_html("ALL", "全部国家", country) + "".join(
+        option_html(code, name, country) for code, name in SCREENING_COUNTRIES.items()
+    )
+    platforms = option_html("", "全部平台", platform) + "".join(
+        option_html(p, p, platform) for p in PLATFORMS
+    )
+    statuses = option_html("ALL", "全部状态", verification) + "".join(
+        option_html(code, name, verification) for code, name in SCREENING_STATUSES.items()
+    )
+    results = "".join(
+        f"""<tr>
+        <td><a href="/creators/{row['id']}">{esc(row['name'])}</a></td>
+        <td>{esc(row['platform'])}</td>
+        <td>{esc(SCREENING_COUNTRIES.get(row['country'] or '', '未核验'))} / {esc(row['city'] or '-')}</td>
+        <td>{esc(row['followers'] if row['followers'] is not None else '未核验')}</td>
+        <td>{esc(row['content_tags'] or '-')}</td>
+        <td>{esc(SCREENING_STATUSES.get(row['screening_status'], '待核验'))}</td>
+        <td>{'有冲突' if row['competitor_conflict'] else '未标记'}</td>
+        <td>{f'<a href="{esc(row["evidence_url"])}" target="_blank" rel="noopener noreferrer">证据</a>' if row['evidence_url'] and row['evidence_url'].startswith(('https://', 'http://')) else '-'}</td>
+        <td>{esc(row['observed_at'] or '-')}</td>
+        </tr>"""
+        for row in rows
+    ) or '<tr><td colspan="9">无匹配记录。先在下方录入候选，核验后再筛选。</td></tr>'
+    flash = query.get("flash", [""])[0]
+    body = f"""
+    <h1>达人筛选</h1>
+    <p class="page-kicker">基于已录入资料筛选；默认沙特、100–1,000 粉、已核验、排除竞品冲突。此页不抓取 TikTok，也不自动邀约。</p>
+    {f'<div class="notice">{esc(error)}</div>' if error else ''}
+    {f'<div class="notice ok">{esc(flash)}</div>' if flash else ''}
+    <form class="panel filters" method="get" action="/screening">
+      <div><label>国家</label><select name="country">{countries}</select></div>
+      <div><label>平台</label><select name="platform">{platforms}</select></div>
+      <div><label>最低粉丝数</label><input type="number" name="min" min="0" value="{esc(minimum)}"></div>
+      <div><label>最高粉丝数</label><input type="number" name="max" min="0" value="{esc(maximum)}"></div>
+      <div><label>内容标签</label><input name="tag" value="{esc(tag)}" placeholder="美妆 / 眼妆 / makeup"></div>
+      <div><label>核验状态</label><select name="verification">{statuses}</select></div>
+      <div><label><input type="checkbox" name="no_conflict" value="1" {'checked' if no_conflict else ''}> 排除已标记竞品冲突</label></div>
+      <div class="actions"><button type="submit">筛选</button><a class="button secondary" href="/screening">重置</a></div>
+    </form>
+    <section class="panel">
+      <h2>筛选结果：{len(rows)} 条</h2>
+      <div class="table-wrap"><table class="compact-table">
+        <thead><tr><th>达人</th><th>平台</th><th>国家/城市</th><th>粉丝</th><th>标签</th><th>核验</th><th>竞品</th><th>来源</th><th>观察日期</th></tr></thead>
+        <tbody>{results}</tbody>
+      </table></div>
+    </section>
+    <form class="panel" method="post" action="/screening/candidates">
+      <h2>录入一位候选达人</h2>
+      <p class="muted">没有核验资料时保留“待核验”；账号名称或阿语内容不等于沙特受众。</p>
+      <div class="grid form-grid">
+        <div><label>所属项目</label><select name="campaign_id">{campaign_options}</select></div>
+        <div><label>账号/名称</label><input name="name" required></div>
+        <div><label>主页 URL</label><input name="profile_url" type="url" placeholder="https://www.tiktok.com/@..."></div>
+        <div><label>平台</label><select name="platform">{"".join(option_html(p, p, "TikTok") for p in PLATFORMS)}</select></div>
+        <div><label>国家（需证据）</label><select name="country">{"".join(option_html(code, name, "") for code, name in SCREENING_COUNTRIES.items())}</select></div>
+        <div><label>城市</label><input name="city"></div>
+        <div><label>粉丝数</label><input type="number" name="followers" min="0"></div>
+        <div><label>标签</label><input name="content_tags" placeholder="美妆, 眼妆"></div>
+        <div><label>核验状态</label><select name="screening_status">{"".join(option_html(code, name, "unverified") for code, name in SCREENING_STATUSES.items())}</select></div>
+        <div><label>观察日期</label><input type="date" name="observed_at"></div>
+        <div class="full"><label>证据 URL</label><input type="url" name="evidence_url" placeholder="https://..."></div>
+        <div class="full"><label>证据说明/备注</label><textarea name="notes"></textarea></div>
+        <div><label><input type="checkbox" name="competitor_conflict" value="1"> 已发现直接竞品冲突</label></div>
+      </div>
+      <div class="actions"><button type="submit">保存候选</button></div>
+    </form>
+    """
+    return layout("达人筛选", body)
+
+
 def creators_page(query):
     q = (query.get("q", [""])[0] or "").strip()
     platform = query.get("platform", [""])[0]
@@ -4043,6 +4198,14 @@ def creator_detail_page(creator_id, flash=""):
             <label>已核验的定制切入点</label>
             <textarea name="personalization_hook" placeholder="例如：主页在 2026-09-23 展示美妆与生活方式内容，并公开提供品牌合作入口。只填实际核验的公开信息。">{esc(creator["personalization_hook"] or "")}</textarea>
           </div>
+          <div><label>国家</label><select name="country">{"".join(option_html(code, name, creator["country"] or "") for code, name in SCREENING_COUNTRIES.items())}</select></div>
+          <div><label>城市</label><input name="city" value="{esc(creator['city'] or '')}"></div>
+          <div><label>粉丝数</label><input type="number" name="followers" min="0" value="{esc(creator['followers'] if creator['followers'] is not None else '')}"></div>
+          <div><label>内容标签</label><input name="content_tags" value="{esc(creator['content_tags'] or '')}" placeholder="美妆, 眼妆"></div>
+          <div><label>核验状态</label><select name="screening_status">{"".join(option_html(code, name, creator["screening_status"] or "unverified") for code, name in SCREENING_STATUSES.items())}</select></div>
+          <div><label>观察日期</label><input type="date" name="observed_at" value="{esc(creator['observed_at'] or '')}"></div>
+          <div class="full"><label>证据 URL</label><input type="url" name="evidence_url" value="{esc(creator['evidence_url'] or '')}"></div>
+          <div><label><input type="checkbox" name="competitor_conflict" value="1" {'checked' if creator['competitor_conflict'] else ''}> 已发现直接竞品冲突</label></div>
           <div class="full">
             <label>达人报价 / 合作备注</label>
             <textarea name="notes" placeholder="例如：报价 $800/video，要求保留样品，预计下周回复。">{esc(creator['notes'] or '')}</textarea>
@@ -4482,6 +4645,8 @@ class App(BaseHTTPRequestHandler):
             return self.redirect("/creators")
         if path == "/creators":
             return self.send_html(creators_page(query))
+        if path == "/screening":
+            return self.send_html(screening_page(query))
         match = re.fullmatch(r"/creators/(\d+)", path)
         if match:
             flash = query.get("flash", [""])[0]
@@ -4553,6 +4718,53 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/screening/candidates":
+            data = parse_post(self)
+            name = (data.get("name") or "").strip()[:120]
+            profile_url = (data.get("profile_url") or "").strip()[:1000]
+            evidence_url = (data.get("evidence_url") or "").strip()[:1000]
+            if not name or (profile_url and not profile_url.startswith(("https://", "http://"))) or (
+                evidence_url and not evidence_url.startswith(("https://", "http://"))
+            ):
+                return self.redirect("/screening?flash=" + urllib.parse.quote("姓名或链接无效"))
+            try:
+                followers = parse_followers(data.get("followers"))
+            except ValueError as exc:
+                return self.redirect("/screening?flash=" + urllib.parse.quote(str(exc)))
+            try:
+                campaign_id = int(data.get("campaign_id") or 0)
+            except ValueError:
+                campaign_id = 0
+            if not load_campaign(campaign_id):
+                return self.redirect("/screening?flash=" + urllib.parse.quote("请先建立项目"))
+            country = data.get("country") if data.get("country") in SCREENING_COUNTRIES else ""
+            status = data.get("screening_status") if data.get("screening_status") in SCREENING_STATUSES else "unverified"
+            # A verified country and follower count need a dated, inspectable source.
+            observed_at = (data.get("observed_at") or "").strip()
+            if status == "verified" and (not evidence_url or not observed_at or followers is None or not country):
+                return self.redirect("/screening?flash=" + urllib.parse.quote("已核验需要国家、粉丝数、证据链接及观察日期"))
+            with db() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM creators WHERE campaign_id = ? AND profile_url = ?",
+                    (campaign_id, profile_url),
+                ).fetchone() if profile_url else None
+            if existing:
+                return self.redirect("/creators/" + str(existing["id"]) + "?flash=" + urllib.parse.quote("该主页已在项目中，请在此编辑"))
+            creator_id = create_creator_for_campaign(
+                campaign_id, name, profile_url=profile_url,
+                platform=data.get("platform") if data.get("platform") in PLATFORMS else "TikTok",
+                notes=(data.get("notes") or "")[:3000],
+            )
+            with db() as conn:
+                conn.execute(
+                    """UPDATE creators SET country=?, city=?, followers=?, content_tags=?, evidence_url=?,
+                       observed_at=?, competitor_conflict=?, screening_status=?, updated_at=? WHERE id=?""",
+                    (country, (data.get("city") or "")[:100], followers,
+                     (data.get("content_tags") or "")[:250], evidence_url, observed_at,
+                     1 if data.get("competitor_conflict") == "1" else 0,
+                     status, now_iso(), creator_id),
+                )
+            return self.redirect("/creators/" + str(creator_id) + "?flash=" + urllib.parse.quote("候选达人已保存，尚未发送邀约"))
         if path == "/replies":
             data = parse_post(self)
             missing = required(data, ["creator_name", "platform", "raw_reply"])
@@ -4672,12 +4884,27 @@ class App(BaseHTTPRequestHandler):
                 flash = "已开始后台生成首封邮件，完成后状态会自动更新。"
             elif action == "save_profile":
                 platform = data.get("platform") if data.get("platform") in PLATFORMS else creator["platform"]
+                try:
+                    followers = parse_followers(data.get("followers"))
+                except ValueError as exc:
+                    flash = str(exc)
+                    return self.redirect(f"{redirect_to}?flash={urllib.parse.quote(flash)}")
+                country = data.get("country") if data.get("country") in SCREENING_COUNTRIES else ""
+                status = data.get("screening_status") if data.get("screening_status") in SCREENING_STATUSES else "unverified"
+                evidence_url = (data.get("evidence_url") or "").strip()[:1000]
+                observed_at = (data.get("observed_at") or "").strip()
+                if status == "verified" and (not country or followers is None or not evidence_url or not observed_at):
+                    return self.redirect(f"{redirect_to}?flash=" + urllib.parse.quote("已核验需要国家、粉丝数、证据链接及观察日期"))
+                if evidence_url and not evidence_url.startswith(("https://", "http://")):
+                    return self.redirect(f"{redirect_to}?flash=" + urllib.parse.quote("证据 URL 无效"))
                 with db() as conn:
                     conn.execute(
                         """
                         UPDATE creators
                         SET name = ?, platform = ?, email = ?, profile_url = ?, preferred_language = ?,
-                            personalization_hook = ?, notes = ?, updated_at = ?
+                            personalization_hook = ?, notes = ?, country = ?, city = ?,
+                            followers = ?, content_tags = ?, evidence_url = ?, observed_at = ?,
+                            competitor_conflict = ?, screening_status = ?, updated_at = ?
                         WHERE id = ?
                         """,
                         (
@@ -4690,6 +4917,14 @@ class App(BaseHTTPRequestHandler):
                             else creator_outreach_language(creator),
                             data.get("personalization_hook"),
                             data.get("notes"),
+                            country,
+                            (data.get("city") or "")[:100],
+                            followers,
+                            (data.get("content_tags") or "")[:250],
+                            evidence_url,
+                            observed_at,
+                            1 if data.get("competitor_conflict") == "1" else 0,
+                            status,
                             now_iso(),
                             creator_id,
                         ),

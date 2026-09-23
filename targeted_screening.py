@@ -185,7 +185,11 @@ def evaluate_candidate(candidate, today=None):
             missing.append(label)
     if not candidate.get("evidence_url") and not candidate.get("source_ref"):
         missing.append("后台数据证据 URL 或来源截图编号")
-    if candidate.get("metrics_window_days") != METRIC_WINDOW_DAYS:
+    window = candidate.get("metrics_window_days")
+    if window == 28:
+        if candidate.get("metrics_review_status") != "accepted_28d":
+            missing.append("28 天代理口径，待人工核验")
+    elif window != METRIC_WINDOW_DAYS:
         missing.append("同一近 30 天统计周期")
     observed_at = candidate.get("observed_at")
     if observed_at:
@@ -209,20 +213,23 @@ def evaluate_candidate(candidate, today=None):
 
 
 def percentile_scores(candidates):
-    """Weighted percentiles within comparable 30-day candidates, not ROI predictions."""
-    comparable = [item for item in candidates if item.get("metrics_window_days") == 30
-                  and all(item.get(key) is not None for key in ("units_sold", "avg_views", "followers"))
-                  and evaluate_candidate(item)[0] != "excluded"]
-    values = {key: sorted(item[key] for item in comparable)
-              for key in ("units_sold", "avg_views", "followers")}
+    """Weighted percentiles within each comparable 28/30-day cohort."""
     def rank(value, sorted_values):
         if len(sorted_values) <= 1:
             return 50.0
         lower = sum(x < value for x in sorted_values)
         equal = sum(x == value for x in sorted_values)
         return 100.0 * (lower + (equal - 1) / 2) / (len(sorted_values) - 1)
-    return {item["handle"]: round(
-        0.5 * rank(item["units_sold"], values["units_sold"])
-        + 0.3 * rank(item["avg_views"], values["avg_views"])
-        + 0.2 * rank(item["followers"], values["followers"]), 1)
-        for item in comparable}
+    scores = {}
+    for window in (28, 30):
+        comparable = [item for item in candidates if item.get("metrics_window_days") == window
+                      and all(item.get(key) is not None for key in ("units_sold", "avg_views", "followers"))
+                      and evaluate_candidate(item)[0] != "excluded"]
+        values = {key: sorted(item[key] for item in comparable)
+                  for key in ("units_sold", "avg_views", "followers")}
+        for item in comparable:
+            scores[item["handle"]] = round(
+                0.5 * rank(item["units_sold"], values["units_sold"])
+                + 0.3 * rank(item["avg_views"], values["avg_views"])
+                + 0.2 * rank(item["followers"], values["followers"]), 1)
+    return scores

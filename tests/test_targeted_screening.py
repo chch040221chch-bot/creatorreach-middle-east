@@ -128,6 +128,24 @@ class TargetedScreeningTest(unittest.TestCase):
         self.assertEqual(outcome, "excluded")
         self.assertIn("粉丝不在", reasons[0])
 
+    def test_28_day_proxy_needs_explicit_human_review(self):
+        row = {
+            "handle": "beauty.proxy", "followers": 5000, "units_sold": 200, "avg_views": 1000,
+            "metrics_window_days": 28, "metrics_review_status": "unknown",
+            "profile_url": "https://www.tiktok.com/@beauty.proxy",
+            "evidence_url": "https://example.com/data", "content_evidence_url": "https://example.com/video",
+            "audience_evidence_url": "https://example.com/audience", "observed_at": date.today().isoformat(),
+            "blacklist_status": "no", "invite_history_checked": 1,
+            "competitor_review_status": "clear", "content_review_status": "fit",
+            "audience_review_status": "fit", "personalization_hook": "已核验的眼妆演示",
+        }
+        outcome, reasons = app.evaluate_candidate(row)
+        self.assertEqual(outcome, "pending")
+        self.assertIn("28 天代理口径，待人工核验", reasons)
+        self.assertIn("beauty.proxy", app.percentile_scores([row]))
+        outcome, _ = app.evaluate_candidate({**row, "metrics_review_status": "accepted_28d"})
+        self.assertEqual(outcome, "ready_for_review")
+
 
 if __name__ == "__main__":
     unittest.main()

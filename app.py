@@ -1,5 +1,7 @@
 import base64
 import email.message
+import email.parser
+import email.policy
 import html
 import json
 import os
@@ -7,19 +9,26 @@ import re
 import secrets
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from targeted_screening import parse_candidates, normalize_handle, evaluate_candidate, percentile_scores
+from targeted_screening import (
+    MIN_FOLLOWERS, MAX_FOLLOWERS, MIN_UNITS_SOLD, MIN_AVG_VIEWS,
+    parse_candidates, normalize_handle, evaluate_candidate, percentile_scores,
+)
 from targeted_invites import parse_batch_terms, parse_sent_at, followup_due
+from fastmoss_import import MAX_XLSX_BYTES, read_fastmoss_export
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "workspace.sqlite3"
+FAST_MOSS_PREVIEWS = {}
+FAST_MOSS_PREVIEW_LOCK = threading.Lock()
 
 CATEGORIES = [
     "interested",
@@ -569,6 +578,10 @@ def migrate_schema(conn):
         ("audience_review_status", "TEXT DEFAULT 'unknown'"),
         ("audience_evidence_url", "TEXT"),
         ("source_ref", "TEXT"),
+        ("metrics_review_status", "TEXT DEFAULT 'unknown'"),
+        ("metric_source", "TEXT"),
+        ("view_metric_type", "TEXT"),
+        ("source_country", "TEXT"),
     ):
         add_column_if_missing(conn, "creators", column, definition)
     add_column_if_missing(conn, "email_logs", "creator_id", "INTEGER")
@@ -1399,6 +1412,33 @@ def parse_post_multi(handler):
     raw = handler.rfile.read(length).decode("utf-8")
     data = urllib.parse.parse_qs(raw, keep_blank_values=True)
     return {k: [item.strip() for item in values] for k, values in data.items()}
+
+
+def parse_multipart_upload(handler):
+    content_type = handler.headers.get("Content-Type", "")
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise ValueError("请通过文件上传表单提交 Excel")
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length <= 0 or length > MAX_XLSX_BYTES + 1_000_000:
+        raise ValueError("上传文件超过 8 MB 上限")
+    raw = handler.rfile.read(length)
+    message = email.parser.BytesParser(policy=email.policy.default).parsebytes(
+        b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode("latin-1") + b"\r\n\r\n" + raw
+    )
+    if not message.is_multipart():
+        raise ValueError("上传表单格式无效")
+    fields, file_content, filename = {}, None, ""
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        content = part.get_payload(decode=True) or b""
+        if name == "xlsx_file":
+            file_content = content
+            filename = part.get_filename() or ""
+        elif name in ("campaign_id", "observed_at"):
+            fields[name] = content.decode("utf-8", errors="replace").strip()
+    if file_content is None or not filename.lower().endswith(".xlsx"):
+        raise ValueError("请选择 FastMoss .xlsx 文件")
+    return fields, file_content, filename
 
 
 def required(data, fields):
@@ -4745,6 +4785,9 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         f'<option value="{item["id"]}"{" selected" if item["id"] == campaign_id else ""}>{esc(item["name"])}</option>'
         for item in campaigns
     )
+    import_options = '<option value="" selected disabled>请选择目标项目</option>' + "".join(
+        f'<option value="{item["id"]}">{esc(item["name"])}</option>' for item in campaigns
+    )
     with db() as conn:
         creators = conn.execute(
             "SELECT * FROM creators WHERE campaign_id=? AND platform='TikTok' AND handle_key IS NOT NULL ORDER BY id DESC",
@@ -4761,16 +4804,23 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         listing.append((0 if outcome == "ready_for_review" else 1 if outcome == "pending" else 2,
                         -(score if score is not None else -1), item, outcome, reasons, score))
     listing.sort(key=lambda x: (x[0], x[1], x[2]["id"]))
+    requested_page = query.get("page", ["1"])[0]
+    page_number = int(requested_page) if requested_page.isdigit() else 1
+    page_count = max(1, (len(listing) + 99) // 100)
+    page_number = max(1, min(page_number, page_count))
+    visible_listing = listing[(page_number - 1) * 100:page_number * 100]
     labels = {"excluded": "排除", "pending": "待核验", "ready_for_review": "待人工审核"}
     rows_html = "".join(
         f'<tr><td><a href="/creators/{item["id"]}">@{esc(item["handle_key"])}</a></td>'
         f'<td>{item["followers"] if item["followers"] is not None else "-"}</td>'
         f'<td>{item["units_sold"] if item["units_sold"] is not None else "-"}</td>'
         f'<td>{item["avg_views"] if item["avg_views"] is not None else "-"}</td>'
-        f'<td>{score if score is not None else "-"}</td><td>{esc(item.get("source_ref") or "-")}</td><td>{labels[outcome]}</td>'
-        f'<td>{esc("；".join(reasons))}</td><td><a href="/targeted-screening?campaign_id={campaign_id}&edit={item["id"]}">核验</a></td></tr>'
-        for _, _, item, outcome, reasons, score in listing
-    ) or '<tr><td colspan="9">暂无站内定邀候选。先粘贴表格预览。</td></tr>'
+        f'<td>{item["metrics_window_days"] if item["metrics_window_days"] is not None else "-"} 天</td>'
+        f'<td>{score if score is not None else "-"}</td><td>{esc(item.get("source_country") or item.get("country") or "-")}</td>'
+        f'<td>{esc(item.get("source_ref") or "-")}</td><td>{labels[outcome]}</td>'
+        f'<td>{esc("；".join(reasons))}</td><td><a href="/targeted-screening?campaign_id={campaign_id}&page={page_number}&edit={item["id"]}">核验</a></td></tr>'
+        for _, _, item, outcome, reasons, score in visible_listing
+    ) or '<tr><td colspan="11">暂无站内定邀候选。先粘贴表格预览。</td></tr>'
     edit_id = query.get("edit", [""])[0]
     edit_item = next((item for item in candidate_rows if str(item["id"]) == edit_id), None)
     edit_html = ""
@@ -4783,6 +4833,7 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         edit_html = f'''<form class="panel" method="post" action="/targeted-screening/candidates/{edit_item["id"]}">
           <h2>核验 @{val("handle_key")}</h2>
           <p>仅填写已实际核实的事实；未核实保持“未知”。</p>
+          <p>数据来源：{val("metric_source") or '-'}；播放口径：{val("view_metric_type") or '-'}；来源国家/地区：{val("source_country") or '-'}。28 天代理数据必须人工核验后才能进入审核包。</p>
           <input type="hidden" name="campaign_id" value="{campaign_id}">
           <div class="grid form-grid">
             <label>主页 URL<input name="profile_url" value="{val("profile_url")}"></label>
@@ -4794,7 +4845,8 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
             <label>观察日期 YYYY-MM-DD<input name="observed_at" value="{val("observed_at")}"></label>
             <label>成交件数<input name="units_sold" type="number" min="0" value="{val("units_sold")}"></label>
             <label>平均播放<input name="avg_views" type="number" min="0" value="{val("avg_views")}"></label>
-            <label>统计天数<input name="metrics_window_days" type="number" min="1" value="{val("metrics_window_days")}"></label>
+            <label>统计天数<input name="metrics_window_days" type="number" min="1" value="{val("metrics_window_days")}"{' readonly' if edit_item.get('metric_source') == 'FastMoss' else ''}></label>
+            <label>28 天代理口径核验<select name="metrics_review_status">{select("metrics_review_status", [("unknown","待核验"),("accepted_28d","已核验并接受 28 天代理")])}</select></label>
             <label>上次邀约日期 YYYY-MM-DD<input name="prior_invited_at" value="{val("prior_invited_at")}"></label>
             <label>历史邀约核查<select name="invite_history_checked"><option value="0">未核查</option><option value="1"{" selected" if edit_item["invite_history_checked"] else ""}>已核查</option></select></label>
             <label>黑名单<select name="blacklist_status">{select("blacklist_status", [("unknown","未知"),("no","未命中"),("yes","命中")])}</select></label>
@@ -4805,13 +4857,18 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         </form>'''
     preview_html = preview or ""
     notice = f'<div class="notice">{esc(flash)}</div>' if flash else ""
-    selectable = [item for _, _, item, outcome, _, _ in listing if outcome == "ready_for_review"]
+    selectable = [item for _, _, item, outcome, _, _ in visible_listing if outcome == "ready_for_review"]
     candidate_choices = "".join(
         f'<label style="display:inline-block;margin:8px 18px 8px 0"><input type="checkbox" name="creator_id" value="{item["id"]}"> @{esc(item["handle_key"])}</label>'
         for item in selectable
     )
     start_default = datetime.now().date().isoformat()
     end_default = (datetime.now().date() + timedelta(days=365)).isoformat()
+    page_links = "".join(
+        f'<a class="button secondary" href="/targeted-screening?campaign_id={campaign_id}&page={target}">{label}</a>'
+        for target, label in ((page_number - 1, "上一页"), (page_number + 1, "下一页"))
+        if 1 <= target <= page_count
+    )
     batch_form = f'''<form class="panel" method="post" action="/targeted-invites">
       <h2>建立发送前审核包</h2><p>仅可选择已完成核验的候选；每批最多 50 人。商品按后台销量顺序填写，最多 15 件。此操作只保存审核包。</p>
       <input type="hidden" name="campaign_id" value="{campaign_id}">
@@ -4825,8 +4882,16 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
       </div><button type="submit">创建待审核批次</button>
     </form>''' if campaign_id else ""
     body = f'''<div class="page-heading"><div><h1>站内定邀候选</h1>
-      <p class="page-kicker">TikTok Shop 工作流：粉丝 1,000–100,000、成交 ≥100 件、平均播放 ≥100。排序只比较同一近 30 天周期，分数是本批相对名次。</p></div></div>
+      <p class="page-kicker">粉丝 1,000–100,000、成交 ≥100 件、平均播放 ≥100。28 天与 30 天数据分别排序；FastMoss 的 28 天代理口径须人工核验。</p></div></div>
       {notice}
+      <form class="panel" method="post" action="/targeted-screening/xlsx-preview" enctype="multipart/form-data">
+        <h2>预览 FastMoss Excel</h2><p>读取 .xlsx 中的近 28 天销量和带货视频平均播放量。预览不写入数据库；导入后仍需人工核验 28 天代理口径、内容、受众及邀约历史。</p>
+        <div class="grid form-grid">
+          <label>目标项目<select name="campaign_id" required>{import_options}</select></label>
+          <label>文件实际导出日期<input type="date" name="observed_at" required></label>
+          <label>FastMoss .xlsx 文件<input type="file" name="xlsx_file" accept=".xlsx" required></label>
+        </div><button type="submit">只读预览 Excel</button>
+      </form>
       <form class="panel" method="post" action="/targeted-screening/preview">
         <h2>批量粘贴并预览</h2><p>支持制表符表格、CSV 或一张 Markdown 表。首行至少包含“账号、粉丝”；建议加成交件数、平均播放、统计天数、来源截图、主页 URL 和观察日期。预览不会保存。</p>
         <label>项目<select name="campaign_id" required>{campaign_options}</select></label>
@@ -4835,7 +4900,9 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
       </form>{preview_html}
       <section class="panel"><h2>已录入候选（{len(listing)}）</h2>
         <p>待人工审核不代表可以发送。核验内容质量、受众和商业适配后，仍须在 TikTok Shop 完成实际邀请。</p>
-        <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>相对分</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+        <p>第 {page_number} / {page_count} 页；每页最多 100 人。相对分仅在相同统计周期内比较。</p>
+        <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>周期</th><th>相对分</th><th>来源国家</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+        <div class="actions">{page_links}</div>
       </section>{batch_form}{edit_html}'''
     return layout("站内定邀", body)
 
@@ -4908,9 +4975,126 @@ def targeted_screening_submit(handler, data, save=False):
     return handler.send_html(targeted_screening_page({"campaign_id": [str(campaign_id)]}, preview=preview, pasted_text=raw))
 
 
+def fastmoss_selected_rows(rows, mode):
+    if mode == "all":
+        return rows
+    eligible = [row for row in rows if row["followers"] is not None
+                and MIN_FOLLOWERS <= row["followers"] <= MAX_FOLLOWERS
+                and row["units_sold"] is not None and row["units_sold"] >= MIN_UNITS_SOLD
+                and row["avg_views"] is not None and row["avg_views"] >= MIN_AVG_VIEWS]
+    if mode == "numeric_all":
+        return eligible
+    if mode == "beauty_numeric":
+        return [row for row in eligible if row["beauty_signal"]]
+    raise ValueError("导入范围无效")
+
+
+def fastmoss_xlsx_preview(handler):
+    fields, content, filename = parse_multipart_upload(handler)
+    try:
+        campaign_id = int(fields.get("campaign_id") or "")
+        observed_date = date.fromisoformat(fields.get("observed_at") or "")
+    except ValueError as exc:
+        raise ValueError("请选择有效项目和文件导出日期") from exc
+    if not load_campaign(campaign_id):
+        raise ValueError("目标项目不存在")
+    if observed_date > date.today():
+        raise ValueError("文件导出日期不能在未来")
+    rows, errors = read_fastmoss_export(content, filename, observed_date.isoformat())
+    if not rows:
+        raise ValueError("没有可识别的达人记录")
+    with db() as conn:
+        duplicate_ids = targeted_duplicate_ids(conn)
+    eligible = fastmoss_selected_rows(rows, "numeric_all")
+    beauty_eligible = fastmoss_selected_rows(rows, "beauty_numeric")
+    duplicates = sum(row["handle"] in duplicate_ids for row in rows)
+    scores = percentile_scores(beauty_eligible)
+    filename_date = re.search(r"20\d{6}", filename)
+    date_notice = ""
+    if filename_date and filename_date.group() != observed_date.strftime("%Y%m%d"):
+        date_notice = (f'<p class="notice">文件名日期 {esc(filename_date.group())} 与填写的导出日期 '
+                       f'{esc(observed_date.isoformat())} 不同，请确认来源。</p>')
+    top_rows = sorted(beauty_eligible, key=lambda row: (-scores.get(row["handle"], -1), row["line_no"]))[:30]
+    samples = "".join(
+        f'<tr><td>@{esc(row["handle"])}</td><td>{row["followers"]}</td>'
+        f'<td>{row["units_sold"]}</td><td>{row["avg_views"] if row["avg_views"] is not None else "缺失"}</td>'
+        f'<td>{scores.get(row["handle"], "-")}</td><td>{esc(row["source_country"])}</td></tr>'
+        for row in top_rows
+    )
+    token = secrets.token_urlsafe(24)
+    with FAST_MOSS_PREVIEW_LOCK:
+        expired = [key for key, value in FAST_MOSS_PREVIEWS.items() if time.monotonic() - value["created"] > 1800]
+        for key in expired:
+            del FAST_MOSS_PREVIEWS[key]
+        while len(FAST_MOSS_PREVIEWS) >= 3:
+            oldest = min(FAST_MOSS_PREVIEWS, key=lambda key: FAST_MOSS_PREVIEWS[key]["created"])
+            del FAST_MOSS_PREVIEWS[oldest]
+        FAST_MOSS_PREVIEWS[token] = {"created": time.monotonic(), "campaign_id": campaign_id,
+                                     "rows": rows, "filename": filename}
+    preview = f'''<section class="panel"><h2>FastMoss 只读预览：{esc(filename)}</h2>
+      <p>共 {len(rows)} 条；数字门槛符合 {len(eligible)} 条；其中有美妆标签或倾向 {len(beauty_eligible)} 条；已存在账号 {duplicates} 条；解析问题 {len(errors)} 条。</p>
+      {date_notice}
+      <p>来源国家/地区只是达人资料，不能当作受众所在地。销量和带货视频播放为近 28 天代理指标，导入后仍是“待人工核验”。以下仅显示美妆数字初筛前 30 名。</p>
+      {f'<p>解析问题示例：{esc("；".join(errors[:10]))}</p>' if errors else ''}
+      <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>28 天销量</th><th>28 天带货视频均播</th><th>同周期相对分</th><th>来源国家</th></tr></thead><tbody>{samples}</tbody></table></div>
+      <form method="post" action="/targeted-screening/xlsx-import">
+        <input type="hidden" name="preview_token" value="{token}">
+        <label>导入范围<select name="mode">
+          <option value="beauty_numeric">仅美妆信号且数字门槛符合（{len(beauty_eligible)} 条，推荐）</option>
+          <option value="numeric_all">所有数字门槛符合（{len(eligible)} 条）</option>
+          <option value="all">全部可解析记录（{len(rows)} 条，含排除项）</option>
+        </select></label>
+        <label><input type="checkbox" name="confirmed" value="1" required> 我确认仅录入候选；历史邀约、黑名单、内容和受众仍需人工核验</label>
+        <button type="submit">确认录入到所选项目（不发送）</button>
+      </form></section>'''
+    return handler.send_html(targeted_screening_page({"campaign_id": [str(campaign_id)]}, preview=preview))
+
+
+def fastmoss_xlsx_import(handler, data):
+    token = data.get("preview_token") or ""
+    with FAST_MOSS_PREVIEW_LOCK:
+        preview = FAST_MOSS_PREVIEWS.get(token)
+    if not preview or time.monotonic() - preview["created"] > 1800:
+        raise ValueError("预览已过期，请重新上传 Excel")
+    if data.get("confirmed") != "1":
+        raise ValueError("请先确认导入范围和待核验状态")
+    selected = fastmoss_selected_rows(preview["rows"], data.get("mode"))
+    campaign_id = preview["campaign_id"]
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        duplicate_ids = targeted_duplicate_ids(conn)
+        inserted, skipped = 0, 0
+        ts = now_iso()
+        for row in selected:
+            if row["handle"] in duplicate_ids:
+                skipped += 1
+                continue
+            creator_id = conn.execute(
+                """INSERT INTO creators
+                   (name, platform, campaign_id, handle_key, profile_url, country, source_country,
+                    followers, units_sold, avg_views, metrics_window_days, metrics_review_status,
+                    metric_source, view_metric_type, evidence_url, observed_at, source_ref,
+                    content_tags, screening_status, outreach_status, created_at, updated_at)
+                   VALUES (?, 'TikTok', ?, ?, ?, ?, ?, ?, ?, ?, 28, 'unknown',
+                           'FastMoss', '近28天带货视频平均播放量', ?, ?, ?, ?, 'unverified',
+                           'to_contact', ?, ?)""",
+                ((row.get("display_name") or "@" + row["handle"])[:120], campaign_id,
+                 row["handle"], row["profile_url"], row["country"], row["source_country"],
+                 row["followers"], row["units_sold"], row["avg_views"], row["evidence_url"],
+                 row["observed_at"], row["source_ref"], row["content_tags"], ts, ts),
+            ).lastrowid
+            duplicate_ids[row["handle"]] = creator_id
+            inserted += 1
+    with FAST_MOSS_PREVIEW_LOCK:
+        FAST_MOSS_PREVIEWS.pop(token, None)
+    message = (f"FastMoss 候选已录入 {inserted} 条，重复跳过 {skipped} 条；"
+               "28 天数据仅作初筛代理，全部仍需人工核验，未发送邀请")
+    return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&flash={urllib.parse.quote(message)}")
+
+
 def targeted_candidate_update(handler, creator_id, data):
     with db() as conn:
-        row = conn.execute("SELECT campaign_id, handle_key FROM creators WHERE id=? AND handle_key IS NOT NULL", (creator_id,)).fetchone()
+        row = conn.execute("SELECT * FROM creators WHERE id=? AND handle_key IS NOT NULL", (creator_id,)).fetchone()
         if not row:
             return handler.send_html(layout("404", '<div class="notice">候选不存在。</div>'), 404)
         campaign_id = row["campaign_id"]
@@ -4932,6 +5116,8 @@ def targeted_candidate_update(handler, creator_id, data):
             if urls[0] and normalize_handle("", urls[0]) != row["handle_key"]:
                 raise ValueError("主页 URL 中的账号与候选账号不一致")
             numbers = [valid_int(k) for k in ("units_sold", "avg_views", "metrics_window_days")]
+            if row["metric_source"] == "FastMoss" and numbers[2] != 28:
+                raise ValueError("FastMoss 原始数据是 28 天，不能直接改标为 30 天")
             dates = [(data.get(k) or "").strip() for k in ("observed_at", "prior_invited_at")]
             for value in dates:
                 if value:
@@ -4940,21 +5126,25 @@ def targeted_candidate_update(handler, creator_id, data):
             competitor = data.get("competitor_review_status", "unknown")
             content = data.get("content_review_status", "unknown")
             audience = data.get("audience_review_status", "unknown")
+            metrics_review = data.get("metrics_review_status", "unknown")
             if blacklist not in ("yes", "no", "unknown") or competitor not in ("clear", "conflict", "unknown"):
                 raise ValueError("核验状态无效")
             if content not in ("fit", "unfit", "unknown") or audience not in ("fit", "unfit", "unknown"):
                 raise ValueError("内容或受众核验状态无效")
+            if metrics_review not in ("unknown", "accepted_28d") or (metrics_review == "accepted_28d" and numbers[2] != 28):
+                raise ValueError("28 天代理核验状态与统计周期不一致")
         except (ValueError, TypeError) as exc:
             return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&edit={creator_id}&flash={urllib.parse.quote(str(exc))}")
         conn.execute(
             """UPDATE creators SET profile_url=?, evidence_url=?, content_evidence_url=?, audience_evidence_url=?, source_ref=?,
                units_sold=?, avg_views=?, metrics_window_days=?, observed_at=?, prior_invited_at=?,
                invite_history_checked=?, blacklist_status=?, competitor_review_status=?,
-               content_review_status=?, audience_review_status=?, personalization_hook=?, updated_at=?
+               content_review_status=?, audience_review_status=?, metrics_review_status=?,
+               personalization_hook=?, updated_at=?
                WHERE id=?""",
             (*urls, (data.get("source_ref") or "")[:300], *numbers, *dates,
              1 if data.get("invite_history_checked") == "1" else 0,
-             blacklist, competitor, content, audience,
+             blacklist, competitor, content, audience, metrics_review,
              (data.get("personalization_hook") or "")[:1000], now_iso(), creator_id),
         )
     return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&edit={creator_id}&flash={urllib.parse.quote('核验事实已保存，未发送邀约')}")
@@ -5030,6 +5220,8 @@ def create_targeted_invite_batch(data):
                 "avg_views": creator["avg_views"], "metrics_window_days": creator["metrics_window_days"],
                 "observed_at": creator["observed_at"], "source_ref": creator["source_ref"],
                 "relative_score": relative_scores.get(creator["handle_key"]),
+                "metric_source": creator["metric_source"], "view_metric_type": creator["view_metric_type"],
+                "source_country": creator["source_country"],
             }
             conn.execute(
                 """INSERT INTO targeted_invite_items
@@ -5412,6 +5604,17 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/targeted-screening/xlsx-preview":
+            try:
+                return fastmoss_xlsx_preview(self)
+            except ValueError as exc:
+                return self.send_html(targeted_screening_page(preview=f'<div class="notice">{esc(exc)}</div>'), 400)
+        if path == "/targeted-screening/xlsx-import":
+            data = parse_post(self)
+            try:
+                return fastmoss_xlsx_import(self, data)
+            except ValueError as exc:
+                return self.redirect("/targeted-screening?flash=" + urllib.parse.quote(str(exc)))
         if path == "/targeted-invites":
             data = parse_post_multi(self)
             try:

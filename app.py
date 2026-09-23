@@ -311,6 +311,8 @@ def init_db():
                 gmail_draft_created_at TEXT,
                 gmail_error TEXT,
                 notes TEXT,
+                preferred_language TEXT DEFAULT 'English',
+                personalization_hook TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -484,6 +486,8 @@ def migrate_schema(conn):
     add_column_if_missing(conn, "creators", "gmail_draft_id", "TEXT")
     add_column_if_missing(conn, "creators", "gmail_draft_created_at", "TEXT")
     add_column_if_missing(conn, "creators", "gmail_error", "TEXT")
+    add_column_if_missing(conn, "creators", "preferred_language", "TEXT DEFAULT 'English'")
+    add_column_if_missing(conn, "creators", "personalization_hook", "TEXT")
     add_column_if_missing(conn, "email_logs", "creator_id", "INTEGER")
     conn.execute(
         """
@@ -1461,16 +1465,37 @@ def load_creator(creator_id):
         ).fetchone()
 
 
-def create_creator_for_campaign(campaign_id, name, email="", profile_url="", platform="YouTube", notes=""):
+def create_creator_for_campaign(
+    campaign_id,
+    name,
+    email="",
+    profile_url="",
+    platform="YouTube",
+    notes="",
+    preferred_language="English",
+    personalization_hook="",
+):
     ts = now_iso()
     with db() as conn:
         cur = conn.execute(
             """
             INSERT INTO creators
-              (name, platform, profile_url, email, campaign_id, outreach_status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'to_contact', ?, ?, ?)
+              (name, platform, profile_url, email, campaign_id, outreach_status, notes,
+               preferred_language, personalization_hook, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'to_contact', ?, ?, ?, ?, ?)
             """,
-            (name, platform, profile_url, email, campaign_id, notes, ts, ts),
+            (
+                name,
+                platform,
+                profile_url,
+                email,
+                campaign_id,
+                notes,
+                preferred_language,
+                personalization_hook,
+                ts,
+                ts,
+            ),
         )
         creator_id = cur.lastrowid
     update_creator_score(creator_id)
@@ -2108,24 +2133,81 @@ def call_ai_json(prompt):
     return json.loads(content)
 
 
+def creator_outreach_language(creator):
+    value = (creator["preferred_language"] or "").strip().lower()
+    mapping = {
+        "arabic": "Arabic",
+        "阿语": "Arabic",
+        "arabic + english": "Arabic + English",
+        "阿语 + 英语": "Arabic + English",
+        "bilingual": "Arabic + English",
+        "双语": "Arabic + English",
+    }
+    return mapping.get(value, "English")
+
+
+def manual_confirmation_sentence(language):
+    if language == "Arabic":
+        return "تتطلب تفاصيل الأسعار أو العينات أو الشحن أو العمولة تأكيدًا يدويًا من فريقنا قبل أي التزام."
+    if language == "Arabic + English":
+        return (
+            "تتطلب تفاصيل الأسعار أو العينات أو الشحن أو العمولة تأكيدًا يدويًا من فريقنا قبل أي التزام.\n"
+            "Pricing, samples, shipping, and commission details require manual confirmation from our team before any commitment."
+        )
+    return "Pricing, samples, shipping, and commission details require manual confirmation from our team before any commitment."
+
+
+def local_outreach_draft(creator, language):
+    campaign = creator["campaign_name"] or "our project"
+    hook = (creator["personalization_hook"] or "").strip()
+    platform = creator["platform"] or "creator platform"
+    english_opening = (
+        f"We noted {hook}."
+        if hook
+        else f"We are reaching out because your {platform} profile may be relevant to our campaign."
+    )
+    arabic_opening = (
+        f"اطّلعنا على {hook}."
+        if hook
+        else f"نتواصل لأن صفحتك على {platform} قد تكون مناسبة لحملتنا."
+    )
+    english = (
+        f"Hi {creator['name']},\n\n"
+        f"{english_opening}\n\n"
+        f"We are exploring a potential collaboration around {campaign}. Would you be open to sharing the best business contact, "
+        f"your availability, and your initial rates or collaboration requirements?\n\n"
+        f"{manual_confirmation_sentence('English')}\n\n"
+        "Best,\n"
+    )
+    arabic = (
+        f"مرحبًا {creator['name']}،\n\n"
+        f"{arabic_opening}\n\n"
+        f"نرغب في بحث إمكانية التعاون ضمن مشروع {campaign}. هل يمكن مشاركة أفضل وسيلة للتواصل التجاري، "
+        f"إلى جانب المواعيد المتاحة والأسعار المبدئية أو متطلبات التعاون؟\n\n"
+        f"{manual_confirmation_sentence('Arabic')}\n\n"
+        "مع أطيب التحيات،\n"
+    )
+    if language == "Arabic":
+        return arabic
+    if language == "Arabic + English":
+        return f"{arabic}\n\n--- English ---\n\n{english}"
+    return english
+
+
 def generate_outreach_for_creator(creator_id):
     creator = load_creator(creator_id)
     if not creator:
         return False, "达人不存在"
-    subject = f"Collaboration Opportunity - {creator['campaign_name'] or 'Our Product'}"
-    local_body = (
-        f"Hi {creator['name']},\n\n"
-        f"I came across your YouTube content and thought you could be a strong fit for "
-        f"{creator['campaign_name'] or 'our product'}.\n\n"
-        f"We would love to explore a potential collaboration. Product details, samples, pricing, "
-        f"commission, inventory, and shipping arrangements all need manual confirmation from our team "
-        f"before we can make any commitment.\n\n"
-        f"Would you be open to taking a look and sharing your collaboration requirements?\n\n"
-        f"Best,\n"
+    language = creator_outreach_language(creator)
+    subject = (
+        f"فرصة تعاون - {creator['campaign_name'] or 'مشروعنا'}"
+        if language == "Arabic"
+        else f"Collaboration Opportunity - {creator['campaign_name'] or 'Our Project'}"
     )
+    local_body = local_outreach_draft(creator, language)
     try:
         prompt = f"""
-Create a first outreach email for a YouTube creator. Return strict JSON only:
+Create a first outreach email for a creator. Return strict JSON only:
 {{
   "subject": "email subject",
   "body": "email body"
@@ -2136,6 +2218,9 @@ Creator:
 - Platform: {creator['platform']}
 - Email: {creator['email'] or ''}
 - Profile URL: {creator['profile_url'] or ''}
+- Preferred outreach language: {language}
+- Verified personalization hook: {creator['personalization_hook'] or 'Not provided'}
+- Internal notes: {creator['notes'] or ''}
 
 Campaign:
 - Product: {creator['campaign_name'] or ''}
@@ -2146,10 +2231,14 @@ Campaign:
 - Brand tone: {creator['brand_tone'] or default_brand_tone()}
 
 Rules:
+- Write in the preferred outreach language. For "Arabic + English", provide Arabic first and then a matching English version.
+- This is for {creator['platform'] or 'a creator platform'}, not specifically YouTube.
+- Only refer to a creator post, audience, location, product preference, or previous brand partnership when it appears in the verified personalization hook or internal notes. If no hook is provided, use a truthful general outreach opening.
 - Follow any "Preferred subject", "Email structure", "What we offer", or creator program details provided in the campaign.
 - Use exact offer terms only when they are explicitly provided in the campaign. Do not invent price, commission, inventory, shipping timeline, or guaranteed sample delivery.
 - If a price, commission, sample, shipping, or inventory term is not explicitly provided, say it needs manual confirmation before commitment.
-- Keep it concise, friendly, and suitable for a YouTube creator collaboration.
+- Do not claim the product is registered, available for shipping, medically approved, suitable for everyone, or able to treat eye conditions unless the campaign explicitly supplies verified wording.
+- Keep it concise, friendly, and suitable for a one-to-one creator collaboration.
 """.strip()
         result = call_ai_json(prompt)
         if result:
@@ -2157,15 +2246,19 @@ Rules:
             body = str(result.get("body") or local_body).strip()
         else:
             body = local_body
-        risk_words = ["price", "commission", "sample", "shipping", "inventory", "样品", "物流", "佣金", "价格", "库存"]
+        risk_words = [
+            "price", "commission", "sample", "shipping", "inventory", "样品", "物流", "佣金", "价格", "库存",
+            "سعر", "عمولة", "عينة", "شحن", "مخزون",
+        ]
         explicit_offer_terms = "fixed offer terms" in (creator["commission_policy"] or "").lower()
         if (
             any(word.lower() in body.lower() for word in risk_words)
             and "manual confirmation" not in body.lower()
             and "需要人工确认" not in body
+            and "تأكيدًا يدويًا" not in body
             and not explicit_offer_terms
         ):
-            body += "\n\nAny pricing, commission, sample, shipping, or inventory details need manual confirmation from our team."
+            body += f"\n\n{manual_confirmation_sentence(language)}"
         ts = now_iso()
         with db() as conn:
             conn.execute(
@@ -3938,6 +4031,18 @@ def creator_detail_page(creator_id, flash=""):
             <label>主页链接</label>
             <input name="profile_url" value="{esc(creator['profile_url'] or '')}" placeholder="https://">
           </div>
+          <div>
+            <label>优先邀约语言</label>
+            <select name="preferred_language">
+              {option_html("Arabic", "阿语", creator["preferred_language"] or "English")}
+              {option_html("English", "英语", creator["preferred_language"] or "English")}
+              {option_html("Arabic + English", "阿语 + 英语", creator["preferred_language"] or "English")}
+            </select>
+          </div>
+          <div class="full">
+            <label>已核验的定制切入点</label>
+            <textarea name="personalization_hook" placeholder="例如：主页在 2026-09-23 展示美妆与生活方式内容，并公开提供品牌合作入口。只填实际核验的公开信息。">{esc(creator["personalization_hook"] or "")}</textarea>
+          </div>
           <div class="full">
             <label>达人报价 / 合作备注</label>
             <textarea name="notes" placeholder="例如：报价 $800/video，要求保留样品，预计下周回复。">{esc(creator['notes'] or '')}</textarea>
@@ -3984,6 +4089,21 @@ def campaigns_page(edit_id=None, flash=""):
     editing = load_campaign(edit_id) if edit_id else None
     notice = f'<div class="notice ok">{esc(flash)}</div>' if flash else ""
     templates = {
+        "saudi_colored_contacts": {
+            "label": "沙特 / GCC 彩色隐形眼镜定向邀约",
+            "selling_points": """Campaign purpose:
+Build a small, verified creator test group for a Saudi / GCC colored-contact-lens launch.
+
+Content direction:
+Natural-looking color change on dark eyes; indoor and daylight presentation; beauty / eye-makeup / lifestyle context.
+
+Product communication:
+Use only confirmed product parameters and approved copy. Do not claim treatment effects, universal suitability, zero irritation, guaranteed comfort, registration, approval, or shipping availability unless separately confirmed.""",
+            "sample_policy": "This is an interest-first outreach. Sample eligibility, shipping market, availability, prescription requirements, delivery timing, and any content obligation require manual confirmation before commitment.",
+            "commission_policy": "Ask for availability, rate card, deliverable options, and usage-rights pricing first. Paid fee, commission, discount code, affiliate attribution, and paid-media usage rights require a written confirmation before commitment.",
+            "forbidden_promises": """Do not promise product registration, medical approval, treatment of dry eyes, universal suitability, zero irritation, or a guaranteed visible result. Do not promise samples, pricing, commission, inventory, shipping, delivery date, discount code, usage rights, exclusivity, or payment terms before manual confirmation. Do not recommend a prescription or ask for sensitive health information in the first outreach.""",
+            "brand_tone": "Warm, respectful, concise and professional. Use Arabic, English, or bilingual copy only as selected for the creator. Avoid invented familiarity and medical claims.",
+        },
         "jujubit_creator_program": {
             "label": "JuJuBit 初始建联 / Creator Program",
             "selling_points": """Preferred subject: Collab? Create a custom 3D model with JuJuBit
@@ -4556,7 +4676,8 @@ class App(BaseHTTPRequestHandler):
                     conn.execute(
                         """
                         UPDATE creators
-                        SET name = ?, platform = ?, email = ?, profile_url = ?, notes = ?, updated_at = ?
+                        SET name = ?, platform = ?, email = ?, profile_url = ?, preferred_language = ?,
+                            personalization_hook = ?, notes = ?, updated_at = ?
                         WHERE id = ?
                         """,
                         (
@@ -4564,6 +4685,10 @@ class App(BaseHTTPRequestHandler):
                             platform,
                             data.get("email"),
                             data.get("profile_url"),
+                            data.get("preferred_language")
+                            if data.get("preferred_language") in ("Arabic", "English", "Arabic + English")
+                            else creator_outreach_language(creator),
+                            data.get("personalization_hook"),
                             data.get("notes"),
                             now_iso(),
                             creator_id,

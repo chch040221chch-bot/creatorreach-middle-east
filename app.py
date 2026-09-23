@@ -10,9 +10,11 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from targeted_screening import parse_candidates, normalize_handle, evaluate_candidate, percentile_scores
+from targeted_invites import parse_batch_terms, parse_sent_at, followup_due
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -505,6 +507,70 @@ def migrate_schema(conn):
         ("screening_status", "TEXT DEFAULT 'unverified'"),
     ):
         add_column_if_missing(conn, "creators", column, definition)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS targeted_invite_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL,
+            products_json TEXT NOT NULL,
+            commission_percent REAL NOT NULL,
+            starts_on TEXT NOT NULL,
+            ends_on TEXT NOT NULL,
+            sample_rule TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT,
+            reviewed_by TEXT,
+            FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+        );
+        CREATE TABLE IF NOT EXISTS targeted_invite_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            creator_id INTEGER NOT NULL,
+            hook_snapshot TEXT NOT NULL,
+            content_url_snapshot TEXT NOT NULL,
+            candidate_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            draft_text TEXT NOT NULL DEFAULT '',
+            review_status TEXT NOT NULL DEFAULT 'pending',
+            reviewed_at TEXT,
+            reviewed_by TEXT,
+            sent_at TEXT,
+            sent_reference TEXT,
+            sent_by TEXT,
+            response_status TEXT NOT NULL DEFAULT 'none',
+            followed_up_at TEXT,
+            followup_note TEXT,
+            UNIQUE (batch_id, creator_id),
+            FOREIGN KEY (batch_id) REFERENCES targeted_invite_batches(id),
+            FOREIGN KEY (creator_id) REFERENCES creators(id)
+        );
+        CREATE TABLE IF NOT EXISTS targeted_invite_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            operator TEXT NOT NULL,
+            reference TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (item_id) REFERENCES targeted_invite_items(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_targeted_invite_items_creator
+            ON targeted_invite_items(creator_id, sent_at);
+    """)
+    add_column_if_missing(conn, "targeted_invite_items", "candidate_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+    for column, definition in (
+        ("handle_key", "TEXT"), ("units_sold", "INTEGER"),
+        ("avg_views", "INTEGER"), ("metrics_window_days", "INTEGER"),
+        ("prior_invited_at", "TEXT"), ("invite_history_checked", "INTEGER DEFAULT 0"),
+        ("blacklist_status", "TEXT DEFAULT 'unknown'"),
+        ("content_evidence_url", "TEXT"),
+        ("competitor_review_status", "TEXT DEFAULT 'unknown'"),
+        ("content_review_status", "TEXT DEFAULT 'unknown'"),
+        ("audience_review_status", "TEXT DEFAULT 'unknown'"),
+        ("audience_evidence_url", "TEXT"),
+        ("source_ref", "TEXT"),
+    ):
+        add_column_if_missing(conn, "creators", column, definition)
     add_column_if_missing(conn, "email_logs", "creator_id", "INTEGER")
     conn.execute(
         """
@@ -550,6 +616,8 @@ def nav_active(title, label):
         "达人跟进中心": "达人数据库",
         "Gmail 草稿": "Gmail 草稿",
         "达人筛选": "达人筛选",
+        "站内定邀": "站内定邀",
+        "定邀审核包": "定邀审核包",
     }
     return " active" if mapping.get(title, title) == label else ""
 
@@ -558,6 +626,8 @@ def layout(title, body, extra_head=""):
     nav_items = [
         ("今日工作台", "/", "总览"),
         ("达人筛选", "/screening", "候选筛选"),
+        ("站内定邀", "/targeted-screening", "站内定邀"),
+        ("定邀审核包", "/targeted-invites", "审核与回填"),
         ("达人数据库", "/creators", "达人记录"),
         ("Gmail 草稿", "/gmail", "邮件草稿"),
         ("错误日志", "/errors", "异常处理"),
@@ -1324,6 +1394,13 @@ def parse_post(handler):
     return {k: v[0].strip() for k, v in data.items()}
 
 
+def parse_post_multi(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    raw = handler.rfile.read(length).decode("utf-8")
+    data = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    return {k: [item.strip() for item in values] for k, values in data.items()}
+
+
 def required(data, fields):
     return [field for field in fields if not data.get(field)]
 
@@ -1785,7 +1862,9 @@ def execute_campaign_action(campaign_id, action):
                     update_task_record(task_id, creator_id, "success" if ok else "failed", result, "" if ok else result)
                     update_creator_score(creator_id)
             elif action == "mark_sent":
-                if not creator["gmail_draft_id"]:
+                if creator["handle_key"]:
+                    update_task_record(task_id, creator_id, "skipped", "站内定邀需记录实际发送凭据；此批量按钮不可标记")
+                elif not creator["gmail_draft_id"]:
                     update_task_record(task_id, creator_id, "skipped", "未创建 Gmail 草稿")
                 else:
                     with db() as conn:
@@ -1796,7 +1875,9 @@ def execute_campaign_action(campaign_id, action):
                     update_task_record(task_id, creator_id, "success", "已标记发送")
                     update_creator_score(creator_id)
             elif action == "mark_done":
-                if creator["outreach_status"] not in ("sent", "replied", "gmail_drafted"):
+                if creator["handle_key"]:
+                    update_task_record(task_id, creator_id, "skipped", "站内定邀需通过审核包记录实际结果")
+                elif creator["outreach_status"] not in ("sent", "replied", "gmail_drafted"):
                     update_task_record(task_id, creator_id, "skipped", "未进入可完成阶段")
                 else:
                     with db() as conn:
@@ -3791,8 +3872,7 @@ def campaign_detail_page(campaign_id, flash=""):
             <form class="row-actions" method="post" action="/creators/{row['id']}/action">
               {generate_action}
               {gmail_action}
-              <button class="quiet-action" type="submit" name="action" value="sent">已发送</button>
-              <button class="quiet-action" type="submit" name="action" value="done">完成</button>
+              {'' if row['handle_key'] else '<button class="quiet-action" type="submit" name="action" value="sent">已发送</button><button class="quiet-action" type="submit" name="action" value="done">完成</button>'}
             </form>
           </td>
         </tr>
@@ -4253,9 +4333,9 @@ def creator_detail_page(creator_id, flash=""):
           <button type="submit" name="action" value="save_outreach">保存邮件</button>
           <button class="secondary" type="submit" name="action" value="generate_outreach">重新生成</button>
           <button class="secondary" type="submit" name="action" value="create_gmail_draft">创建 Gmail 草稿</button>
-          <button class="secondary" type="submit" name="action" value="sent">标记已发送</button>
-          <button class="secondary" type="submit" name="action" value="done">完成</button>
+          {'' if creator['handle_key'] else '<button class="secondary" type="submit" name="action" value="sent">标记已发送</button><button class="secondary" type="submit" name="action" value="done">完成</button>'}
         </div>
+        {'<p class="muted">站内定邀的实际发送需在后续审核包中记录；保存邮件草稿不会标记已发送。</p>' if creator['handle_key'] else ''}
       </form>
     </section>
     <section class="two">
@@ -4640,6 +4720,580 @@ def errors_page(error_id=None, flash=""):
     return layout("错误日志", body)
 
 
+def targeted_duplicate_ids(conn):
+    """Include legacy creator rows whose handle_key has not been populated."""
+    rows = conn.execute(
+        "SELECT id, name, profile_url, handle_key FROM creators WHERE platform='TikTok'"
+    ).fetchall()
+    result = {}
+    for row in rows:
+        handle = row["handle_key"] or normalize_handle(
+            row["name"] if (row["name"] or "").startswith("@") else "", row["profile_url"]
+        )
+        if handle:
+            result.setdefault(handle, row["id"])
+    return result
+
+
+def targeted_screening_page(query=None, preview=None, pasted_text=""):
+    query = query or {}
+    campaigns = list_campaigns()
+    requested = query.get("campaign_id", [""])[0]
+    campaign_id = int(requested) if requested.isdigit() else (campaigns[0]["id"] if campaigns else 0)
+    flash = query.get("flash", [""])[0]
+    campaign_options = "".join(
+        f'<option value="{item["id"]}"{" selected" if item["id"] == campaign_id else ""}>{esc(item["name"])}</option>'
+        for item in campaigns
+    )
+    with db() as conn:
+        creators = conn.execute(
+            "SELECT * FROM creators WHERE campaign_id=? AND platform='TikTok' AND handle_key IS NOT NULL ORDER BY id DESC",
+            (campaign_id,),
+        ).fetchall() if campaign_id else []
+    candidate_rows = [dict(item) for item in creators]
+    for item in candidate_rows:
+        item["handle"] = item["handle_key"]
+    scores = percentile_scores(candidate_rows)
+    listing = []
+    for item in candidate_rows:
+        outcome, reasons = evaluate_candidate(item)
+        score = scores.get(item["handle_key"])
+        listing.append((0 if outcome == "ready_for_review" else 1 if outcome == "pending" else 2,
+                        -(score if score is not None else -1), item, outcome, reasons, score))
+    listing.sort(key=lambda x: (x[0], x[1], x[2]["id"]))
+    labels = {"excluded": "排除", "pending": "待核验", "ready_for_review": "待人工审核"}
+    rows_html = "".join(
+        f'<tr><td><a href="/creators/{item["id"]}">@{esc(item["handle_key"])}</a></td>'
+        f'<td>{item["followers"] if item["followers"] is not None else "-"}</td>'
+        f'<td>{item["units_sold"] if item["units_sold"] is not None else "-"}</td>'
+        f'<td>{item["avg_views"] if item["avg_views"] is not None else "-"}</td>'
+        f'<td>{score if score is not None else "-"}</td><td>{esc(item.get("source_ref") or "-")}</td><td>{labels[outcome]}</td>'
+        f'<td>{esc("；".join(reasons))}</td><td><a href="/targeted-screening?campaign_id={campaign_id}&edit={item["id"]}">核验</a></td></tr>'
+        for _, _, item, outcome, reasons, score in listing
+    ) or '<tr><td colspan="9">暂无站内定邀候选。先粘贴表格预览。</td></tr>'
+    edit_id = query.get("edit", [""])[0]
+    edit_item = next((item for item in candidate_rows if str(item["id"]) == edit_id), None)
+    edit_html = ""
+    if edit_item:
+        def val(key):
+            return esc(str(edit_item.get(key) if edit_item.get(key) is not None else ""))
+        def select(key, choices):
+            current = edit_item.get(key) or "unknown"
+            return "".join(f'<option value="{v}"{" selected" if current == v else ""}>{label}</option>' for v, label in choices)
+        edit_html = f'''<form class="panel" method="post" action="/targeted-screening/candidates/{edit_item["id"]}">
+          <h2>核验 @{val("handle_key")}</h2>
+          <p>仅填写已实际核实的事实；未核实保持“未知”。</p>
+          <input type="hidden" name="campaign_id" value="{campaign_id}">
+          <div class="grid form-grid">
+            <label>主页 URL<input name="profile_url" value="{val("profile_url")}"></label>
+            <label>后台数据证据 URL<input name="evidence_url" value="{val("evidence_url")}"></label>
+            <label>来源截图编号 / 文件名<input name="source_ref" value="{val("source_ref")}"></label>
+            <label>近期内容证据 URL<input name="content_evidence_url" value="{val("content_evidence_url")}"></label>
+            <label>受众证据 URL<input name="audience_evidence_url" value="{val("audience_evidence_url")}"></label>
+            <label>已核验的个性化切入点<input name="personalization_hook" value="{val("personalization_hook")}"></label>
+            <label>观察日期 YYYY-MM-DD<input name="observed_at" value="{val("observed_at")}"></label>
+            <label>成交件数<input name="units_sold" type="number" min="0" value="{val("units_sold")}"></label>
+            <label>平均播放<input name="avg_views" type="number" min="0" value="{val("avg_views")}"></label>
+            <label>统计天数<input name="metrics_window_days" type="number" min="1" value="{val("metrics_window_days")}"></label>
+            <label>上次邀约日期 YYYY-MM-DD<input name="prior_invited_at" value="{val("prior_invited_at")}"></label>
+            <label>历史邀约核查<select name="invite_history_checked"><option value="0">未核查</option><option value="1"{" selected" if edit_item["invite_history_checked"] else ""}>已核查</option></select></label>
+            <label>黑名单<select name="blacklist_status">{select("blacklist_status", [("unknown","未知"),("no","未命中"),("yes","命中")])}</select></label>
+            <label>竞品冲突<select name="competitor_review_status">{select("competitor_review_status", [("unknown","未知"),("clear","未发现"),("conflict","已确认冲突")])}</select></label>
+            <label>内容契合<select name="content_review_status">{select("content_review_status", [("unknown","未知"),("fit","已核验契合"),("unfit","不契合")])}</select></label>
+            <label>受众契合<select name="audience_review_status">{select("audience_review_status", [("unknown","未知"),("fit","已核验契合"),("unfit","不契合")])}</select></label>
+          </div><button type="submit">保存核验事实</button>
+        </form>'''
+    preview_html = preview or ""
+    notice = f'<div class="notice">{esc(flash)}</div>' if flash else ""
+    selectable = [item for _, _, item, outcome, _, _ in listing if outcome == "ready_for_review"]
+    candidate_choices = "".join(
+        f'<label style="display:inline-block;margin:8px 18px 8px 0"><input type="checkbox" name="creator_id" value="{item["id"]}"> @{esc(item["handle_key"])}</label>'
+        for item in selectable
+    )
+    start_default = datetime.now().date().isoformat()
+    end_default = (datetime.now().date() + timedelta(days=365)).isoformat()
+    batch_form = f'''<form class="panel" method="post" action="/targeted-invites">
+      <h2>建立发送前审核包</h2><p>仅可选择已完成核验的候选；每批最多 50 人。商品按后台销量顺序填写，最多 15 件。此操作只保存审核包。</p>
+      <input type="hidden" name="campaign_id" value="{campaign_id}">
+      <div>{candidate_choices or '暂无资料齐全的候选；请先补全核验。'}</div>
+      <div class="grid form-grid">
+        <label>前 15 畅销商品（每行一件）<textarea name="products" required></textarea></label>
+        <label>样品审批规则<textarea name="sample_rule" required placeholder="例如：仅人工批准后寄样"></textarea></label>
+        <label>佣金比例 %<input type="number" name="commission_percent" min="0.01" max="100" step="0.01" value="10" required></label>
+        <label>开始日期<input type="date" name="starts_on" value="{start_default}" required></label>
+        <label>结束日期<input type="date" name="ends_on" value="{end_default}" required></label>
+      </div><button type="submit">创建待审核批次</button>
+    </form>''' if campaign_id else ""
+    body = f'''<div class="page-heading"><div><h1>站内定邀候选</h1>
+      <p class="page-kicker">TikTok Shop 工作流：粉丝 1,000–100,000、成交 ≥100 件、平均播放 ≥100。排序只比较同一近 30 天周期，分数是本批相对名次。</p></div></div>
+      {notice}
+      <form class="panel" method="post" action="/targeted-screening/preview">
+        <h2>批量粘贴并预览</h2><p>支持制表符表格、CSV 或一张 Markdown 表。首行至少包含“账号、粉丝”；建议加成交件数、平均播放、统计天数、来源截图、主页 URL 和观察日期。预览不会保存。</p>
+        <label>项目<select name="campaign_id" required>{campaign_options}</select></label>
+        <label>候选表<textarea name="candidates" rows="8" placeholder="账号&#9;粉丝&#9;成交件数&#9;平均播放&#9;统计天数\nexample.creator&#9;1.2万&#9;230&#9;3500&#9;30">{esc(pasted_text)}</textarea></label>
+        <button type="submit">预览候选</button>
+      </form>{preview_html}
+      <section class="panel"><h2>已录入候选（{len(listing)}）</h2>
+        <p>待人工审核不代表可以发送。核验内容质量、受众和商业适配后，仍须在 TikTok Shop 完成实际邀请。</p>
+        <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>相对分</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+      </section>{batch_form}{edit_html}'''
+    return layout("站内定邀", body)
+
+
+def targeted_screening_submit(handler, data, save=False):
+    try:
+        campaign_id = int(data.get("campaign_id") or 0)
+    except ValueError:
+        campaign_id = 0
+    if not load_campaign(campaign_id):
+        return handler.send_html(targeted_screening_page(preview='<div class="notice">请先建立项目。</div>'), 400)
+    raw = (data.get("candidates") or "")
+    if len(raw) > 200_000:
+        return handler.send_html(targeted_screening_page(preview='<div class="notice">单次粘贴内容过长，请分批处理。</div>'), 400)
+    rows, errors = parse_candidates(raw)
+    if len(rows) > 500:
+        errors.append("单次最多预览 500 人")
+    if errors:
+        detail = "<br>".join(esc(error) for error in errors[:30])
+        return handler.send_html(targeted_screening_page({"campaign_id": [str(campaign_id)]}, preview=f'<div class="notice">{detail}</div>', pasted_text=raw), 400)
+    with db() as conn:
+        if save:
+            conn.execute("BEGIN IMMEDIATE")
+        duplicate_ids = targeted_duplicate_ids(conn)
+        if save:
+            inserted, skipped = 0, 0
+            ts = now_iso()
+            for item in rows:
+                if item["handle"] in duplicate_ids:
+                    skipped += 1
+                    continue
+                cur = conn.execute(
+                    """INSERT INTO creators
+                    (name, platform, campaign_id, handle_key, profile_url, followers, units_sold,
+                     avg_views, metrics_window_days, evidence_url, content_evidence_url,
+                     observed_at, prior_invited_at, blacklist_status, source_ref, outreach_status,
+                     screening_status, created_at, updated_at)
+                    VALUES (?, 'TikTok', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'to_contact',
+                            'unverified', ?, ?)""",
+                    ("@" + item["handle"], campaign_id, item["handle"], item.get("profile_url", ""),
+                     item.get("followers"), item.get("units_sold"), item.get("avg_views"),
+                     item.get("metrics_window_days"), item.get("evidence_url", ""),
+                     item.get("content_evidence_url", ""), item.get("observed_at", ""),
+                     item.get("prior_invited_at", ""), item.get("blacklist_status") or "unknown",
+                     item.get("source_ref", "")[:300], ts, ts),
+                )
+                duplicate_ids[item["handle"]] = cur.lastrowid
+                inserted += 1
+            message = f"已录入 {inserted} 人；跳过已有账号 {skipped} 人。所有人仍需完成核验，未发送邀约。"
+            return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&flash={urllib.parse.quote(message)}")
+    labels = {"excluded": "排除", "pending": "待核验", "ready_for_review": "待人工审核"}
+    scores = percentile_scores(rows)
+    table = []
+    for item in rows:
+        duplicate = duplicate_ids.get(item["handle"])
+        outcome, reasons = evaluate_candidate(item)
+        if duplicate:
+            outcome, reasons = "excluded", [f"已有同平台账号档案 #{duplicate}"]
+        table.append(f'<tr><td>@{esc(item["handle"])}</td><td>{item["followers"]}</td>'
+                     f'<td>{item.get("units_sold") if item.get("units_sold") is not None else "-"}</td>'
+                     f'<td>{item.get("avg_views") if item.get("avg_views") is not None else "-"}</td>'
+                     f'<td>{scores.get(item["handle"], "-")}</td><td>{esc(item.get("source_ref") or "-")}</td><td>{labels[outcome]}</td>'
+                     f'<td>{esc("；".join(reasons))}</td></tr>')
+    preview = f'''<section class="panel"><h2>预览 {len(rows)} 人</h2>
+      <p>预览只做门槛判断与证据提示。重复账号会跳过；其他候选保存后继续核验。</p>
+      <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>相对分</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th></tr></thead><tbody>{"".join(table)}</tbody></table></div>
+      <form method="post" action="/targeted-screening/import"><input type="hidden" name="campaign_id" value="{campaign_id}">
+        <textarea name="candidates" style="display:none">{esc(raw)}</textarea>
+        <button type="submit">确认录入候选（不发送）</button></form></section>'''
+    return handler.send_html(targeted_screening_page({"campaign_id": [str(campaign_id)]}, preview=preview, pasted_text=raw))
+
+
+def targeted_candidate_update(handler, creator_id, data):
+    with db() as conn:
+        row = conn.execute("SELECT campaign_id, handle_key FROM creators WHERE id=? AND handle_key IS NOT NULL", (creator_id,)).fetchone()
+        if not row:
+            return handler.send_html(layout("404", '<div class="notice">候选不存在。</div>'), 404)
+        campaign_id = row["campaign_id"]
+        def valid_url(key):
+            value = (data.get(key) or "").strip()[:1000]
+            if value and not value.startswith(("https://", "http://")):
+                raise ValueError(f"{key} 必须是 http(s) 链接")
+            return value
+        def valid_int(key):
+            value = (data.get(key) or "").strip()
+            if not value:
+                return None
+            number = int(value)
+            if number < 0:
+                raise ValueError(f"{key} 不能小于 0")
+            return number
+        try:
+            urls = [valid_url(k) for k in ("profile_url", "evidence_url", "content_evidence_url", "audience_evidence_url")]
+            if urls[0] and normalize_handle("", urls[0]) != row["handle_key"]:
+                raise ValueError("主页 URL 中的账号与候选账号不一致")
+            numbers = [valid_int(k) for k in ("units_sold", "avg_views", "metrics_window_days")]
+            dates = [(data.get(k) or "").strip() for k in ("observed_at", "prior_invited_at")]
+            for value in dates:
+                if value:
+                    datetime.strptime(value, "%Y-%m-%d")
+            blacklist = data.get("blacklist_status", "unknown")
+            competitor = data.get("competitor_review_status", "unknown")
+            content = data.get("content_review_status", "unknown")
+            audience = data.get("audience_review_status", "unknown")
+            if blacklist not in ("yes", "no", "unknown") or competitor not in ("clear", "conflict", "unknown"):
+                raise ValueError("核验状态无效")
+            if content not in ("fit", "unfit", "unknown") or audience not in ("fit", "unfit", "unknown"):
+                raise ValueError("内容或受众核验状态无效")
+        except (ValueError, TypeError) as exc:
+            return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&edit={creator_id}&flash={urllib.parse.quote(str(exc))}")
+        conn.execute(
+            """UPDATE creators SET profile_url=?, evidence_url=?, content_evidence_url=?, audience_evidence_url=?, source_ref=?,
+               units_sold=?, avg_views=?, metrics_window_days=?, observed_at=?, prior_invited_at=?,
+               invite_history_checked=?, blacklist_status=?, competitor_review_status=?,
+               content_review_status=?, audience_review_status=?, personalization_hook=?, updated_at=?
+               WHERE id=?""",
+            (*urls, (data.get("source_ref") or "")[:300], *numbers, *dates,
+             1 if data.get("invite_history_checked") == "1" else 0,
+             blacklist, competitor, content, audience,
+             (data.get("personalization_hook") or "")[:1000], now_iso(), creator_id),
+        )
+    return handler.redirect(f"/targeted-screening?campaign_id={campaign_id}&edit={creator_id}&flash={urllib.parse.quote('核验事实已保存，未发送邀约')}")
+
+
+def targeted_invite_event(conn, item_id, event_type, operator, reference="", note="", occurred_at=None):
+    conn.execute(
+        """INSERT INTO targeted_invite_events
+           (item_id, event_type, occurred_at, operator, reference, note, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (item_id, event_type, occurred_at or now_iso(), operator, reference, note, now_iso()),
+    )
+
+
+def create_targeted_invite_batch(data):
+    def first(key):
+        return (data.get(key) or [""])[0]
+    try:
+        campaign_id = int(first("campaign_id"))
+        creator_ids = [int(value) for value in data.get("creator_id", [])]
+    except ValueError as exc:
+        raise ValueError("项目或达人编号无效") from exc
+    if not 1 <= len(creator_ids) <= 50 or len(creator_ids) != len(set(creator_ids)):
+        raise ValueError("每批请选择 1–50 位不重复达人")
+    products, commission, starts, ends, sample_rule = parse_batch_terms(
+        {key: first(key) for key in ("products", "commission_percent", "starts_on", "ends_on", "sample_rule")}
+    )
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM campaigns WHERE id=?", (campaign_id,)).fetchone():
+            raise ValueError("项目不存在")
+        placeholders = ",".join("?" for _ in creator_ids)
+        creator_rows = conn.execute(
+            f"SELECT * FROM creators WHERE id IN ({placeholders})", creator_ids
+        ).fetchall()
+        creators_by_id = {row["id"]: row for row in creator_rows}
+        all_candidates = [dict(row) for row in conn.execute(
+            "SELECT * FROM creators WHERE campaign_id=? AND platform='TikTok' AND handle_key IS NOT NULL",
+            (campaign_id,),
+        ).fetchall()]
+        for candidate in all_candidates:
+            candidate["handle"] = candidate["handle_key"]
+        relative_scores = percentile_scores(all_candidates)
+        if len(creators_by_id) != len(creator_ids):
+            raise ValueError("候选达人不存在")
+        for creator_id in creator_ids:
+            creator = creators_by_id[creator_id]
+            if creator["campaign_id"] != campaign_id or creator["platform"] != "TikTok" or not creator["handle_key"]:
+                raise ValueError(f"达人 #{creator_id} 不属于该站内定邀项目")
+            outcome, reasons = evaluate_candidate(dict(creator))
+            if outcome != "ready_for_review":
+                raise ValueError(f"@{creator['handle_key']} 尚不可进入审核包：{'；'.join(reasons)}")
+            active = conn.execute(
+                """SELECT 1 FROM targeted_invite_items i
+                   JOIN targeted_invite_batches b ON b.id=i.batch_id
+                   WHERE i.creator_id=? AND i.sent_at IS NULL AND b.status IN ('draft','reviewed') LIMIT 1""",
+                (creator_id,),
+            ).fetchone()
+            if active:
+                raise ValueError(f"@{creator['handle_key']} 已在未发送的审核包中")
+        ts = now_iso()
+        batch_id = conn.execute(
+            """INSERT INTO targeted_invite_batches
+               (campaign_id, products_json, commission_percent, starts_on, ends_on,
+                sample_rule, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'draft', ?)""",
+            (campaign_id, json.dumps(products, ensure_ascii=False), commission, starts, ends, sample_rule, ts),
+        ).lastrowid
+        for creator_id in creator_ids:
+            creator = creators_by_id[creator_id]
+            snapshot = {
+                "followers": creator["followers"], "units_sold": creator["units_sold"],
+                "avg_views": creator["avg_views"], "metrics_window_days": creator["metrics_window_days"],
+                "observed_at": creator["observed_at"], "source_ref": creator["source_ref"],
+                "relative_score": relative_scores.get(creator["handle_key"]),
+            }
+            conn.execute(
+                """INSERT INTO targeted_invite_items
+                   (batch_id, creator_id, hook_snapshot, content_url_snapshot, candidate_snapshot_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (batch_id, creator_id, creator["personalization_hook"], creator["content_evidence_url"],
+                 json.dumps(snapshot, ensure_ascii=False)),
+            )
+    return batch_id
+
+
+def targeted_invites_page(query=None):
+    query = query or {}
+    flash = query.get("flash", [""])[0]
+    with db() as conn:
+        batches = conn.execute(
+            """SELECT b.*, c.name AS campaign_name, COUNT(i.id) AS item_count,
+               SUM(CASE WHEN i.review_status='approved' THEN 1 ELSE 0 END) AS approved_count,
+               SUM(CASE WHEN i.sent_at IS NOT NULL THEN 1 ELSE 0 END) AS sent_count
+               FROM targeted_invite_batches b
+               JOIN campaigns c ON c.id=b.campaign_id
+               LEFT JOIN targeted_invite_items i ON i.batch_id=b.id
+               GROUP BY b.id ORDER BY b.id DESC"""
+        ).fetchall()
+        sent_items = conn.execute(
+            "SELECT id, sent_at, response_status, followed_up_at FROM targeted_invite_items WHERE sent_at IS NOT NULL"
+        ).fetchall()
+    due_count = sum(followup_due(item) for item in sent_items)
+    batch_rows = "".join(
+        f'<tr><td><a href="/targeted-invites/{row["id"]}">批次 #{row["id"]}</a></td>'
+        f'<td>{esc(row["campaign_name"])}</td><td>{esc(row["status"])}</td>'
+        f'<td>{row["item_count"]}</td><td>{row["approved_count"] or 0}</td>'
+        f'<td>{row["sent_count"] or 0}</td><td>{esc(row["created_at"])}</td></tr>' for row in batches
+    ) or '<tr><td colspan="7">暂无审核包。先在“站内定邀”页面核验候选并建立批次。</td></tr>'
+    due_rows = ""
+    if due_count:
+        with db() as conn:
+            due_items = conn.execute(
+                """SELECT i.id, i.batch_id, i.sent_at, i.response_status, i.followed_up_at,
+                   c.name AS creator_name FROM targeted_invite_items i
+                   JOIN creators c ON c.id=i.creator_id WHERE i.sent_at IS NOT NULL
+                   ORDER BY i.sent_at"""
+            ).fetchall()
+        due_rows = "".join(
+            f'<li><a href="/targeted-invites/{item["batch_id"]}">{esc(item["creator_name"])} · 批次 #{item["batch_id"]}</a>'
+            f'（实际邀请：{esc(item["sent_at"]) }）</li>'
+            for item in due_items if followup_due(item)
+        )
+    body = f'''<div class="page-heading"><div><h1>定邀审核包</h1>
+       <p class="page-kicker">审核条件、人工站内发送和后续状态分开记录。此页面不会调用 TikTok Shop API。</p></div></div>
+       {f'<div class="notice">{esc(flash)}</div>' if flash else ''}
+       <section class="panel"><h2>七天待跟进：{due_count} 人</h2>
+       <p>只按实际发送时间和仍未收到结果的状态计算。</p><ul>{due_rows or '<li>当前没有到期项。</li>'}</ul></section>
+       <section class="panel"><h2>审核批次</h2><div style="overflow-x:auto"><table>
+       <thead><tr><th>批次</th><th>项目</th><th>状态</th><th>人数</th><th>已审草稿</th><th>已回填发送</th><th>创建时间</th></tr></thead>
+       <tbody>{batch_rows}</tbody></table></div></section>'''
+    return layout("定邀审核包", body)
+
+
+def targeted_invite_batch_page(batch_id, flash=""):
+    with db() as conn:
+        batch = conn.execute(
+            """SELECT b.*, c.name AS campaign_name FROM targeted_invite_batches b
+               JOIN campaigns c ON c.id=b.campaign_id WHERE b.id=?""", (batch_id,)
+        ).fetchone()
+        if not batch:
+            return layout("404", '<div class="notice">审核包不存在。</div>')
+        items = conn.execute(
+            """SELECT i.*, c.name AS creator_name, c.handle_key FROM targeted_invite_items i
+               JOIN creators c ON c.id=i.creator_id WHERE i.batch_id=? ORDER BY i.id""", (batch_id,)
+        ).fetchall()
+        events = conn.execute(
+            """SELECT e.* FROM targeted_invite_events e
+               JOIN targeted_invite_items i ON i.id=e.item_id WHERE i.batch_id=?
+               ORDER BY e.id DESC""", (batch_id,)
+        ).fetchall()
+    products = json.loads(batch["products_json"])
+    product_html = "".join(f'<li>{esc(product)}</li>' for product in products)
+    event_map = {}
+    for event in events:
+        event_map.setdefault(event["item_id"], []).append(event)
+    item_html = ""
+    for item in items:
+        candidate_snapshot = json.loads(item["candidate_snapshot_json"] or "{}")
+        item_events = "".join(
+            f'<li>{esc(event["occurred_at"])} · {esc(event["event_type"])} · {esc(event["operator"])}'
+            f'{" · " + esc(event["reference"]) if event["reference"] else ""}</li>'
+            for event in event_map.get(item["id"], [])
+        )
+        if batch["status"] == "draft":
+            action_html = f'''<form method="post" action="/targeted-invites/{batch_id}/items/{item["id"]}/review">
+               <label>站内邀约草稿<textarea name="draft_text" rows="5" required>{esc(item["draft_text"])}</textarea></label>
+               <label>审核人<input name="reviewer" value="{esc(item["reviewed_by"] or "")}" placeholder="姓名或工号"></label>
+               <div class="actions"><button type="submit" name="review_action" value="save">保存草稿</button>
+               <button type="submit" name="review_action" value="approve">人工审核通过</button></div></form>'''
+        elif not item["sent_at"]:
+            action_html = f'''<form method="post" action="/targeted-invites/{batch_id}/items/{item["id"]}/sent">
+               <p><strong>已审核草稿：</strong>{esc(item["draft_text"])}</p>
+               <label>实际站内发送时间<input type="datetime-local" name="sent_at" required></label>
+               <label>操作者<input name="operator" required></label>
+               <label>站内邀请编号或截图编号<input name="reference" required></label>
+               <label><input type="checkbox" name="confirmed" value="1" required> 我已在 TikTok Shop 实际完成这条邀请</label>
+               <button type="submit">回填实际发送</button></form>'''
+        else:
+            status_options = "".join(
+                f'<option value="{code}"{" selected" if item["response_status"] == code else ""}>{label}</option>'
+                for code, label in (("none", "尚无结果"), ("accepted", "已接受"),
+                                    ("replied", "已回复"), ("rejected", "已拒绝"))
+            )
+            action_html = f'''<p><strong>实际发送：</strong>{esc(item["sent_at"])} · {esc(item["sent_by"])} · {esc(item["sent_reference"])}</p>
+               <form method="post" action="/targeted-invites/{batch_id}/items/{item["id"]}/response">
+                 <label>站内结果<select name="response_status">{status_options}</select></label>
+                 <label>核实人<input name="operator" required></label>
+                 <label>结果凭据或备注<input name="reference" required></label>
+                 <button type="submit">记录结果</button></form>'''
+            if followup_due(item):
+                action_html += f'''<form method="post" action="/targeted-invites/{batch_id}/items/{item["id"]}/followup">
+                  <label>跟进操作者<input name="operator" required></label>
+                  <label>实际跟进凭据或备注<input name="reference" required></label>
+                  <button type="submit">记录已跟进</button></form>'''
+        item_html += f'''<section class="panel"><h3>@{esc(item["handle_key"] or item["creator_name"])}</h3>
+          <p><strong>入选快照：</strong>粉丝 {esc(candidate_snapshot.get("followers", "-"))} · 成交 {esc(candidate_snapshot.get("units_sold", "-"))} · 平均播放 {esc(candidate_snapshot.get("avg_views", "-"))} · 相对分 {esc(candidate_snapshot.get("relative_score", "-"))} · 统计 {esc(candidate_snapshot.get("metrics_window_days", "-"))} 天 · 观察 {esc(candidate_snapshot.get("observed_at", "-"))} · 来源 {esc(candidate_snapshot.get("source_ref", "-"))}</p>
+          <p><strong>入选切入点：</strong>{esc(item["hook_snapshot"])}</p>
+          <p><strong>内容证据：</strong>{esc(item["content_url_snapshot"])}</p>
+          <p><strong>草稿审核：</strong>{esc(item["review_status"])}；<strong>站内结果：</strong>{esc(item["response_status"])}。</p>
+          {action_html}<details><summary>事件记录（{len(event_map.get(item["id"], []))}）</summary><ul>{item_events or '<li>暂无事件</li>'}</ul></details>
+        </section>'''
+    approved = all(item["review_status"] == "approved" for item in items)
+    approve_form = f'''<form class="panel" method="post" action="/targeted-invites/{batch_id}/approve">
+       <h2>批次审核</h2><p>确认商品、佣金、期限、样品规则及每人的个性化草稿。审核后条件与草稿锁定。</p>
+       <label>审核人<input name="reviewer" required></label>
+       <button type="submit" {'' if approved else 'disabled'}>审核通过，生成站内操作清单</button></form>''' if batch["status"] == "draft" else ""
+    body = f'''<div class="page-heading"><div><h1>定邀审核包 #{batch_id}</h1>
+      <p class="page-kicker"><a href="/targeted-invites">返回审核包</a> · {esc(batch["campaign_name"])} · {esc(batch["status"])}</p></div></div>
+      {f'<div class="notice">{esc(flash)}</div>' if flash else ''}
+      <section class="panel"><h2>冻结的邀约条件</h2><p>佣金：{batch["commission_percent"]}%；期限：{esc(batch["starts_on"])} 至 {esc(batch["ends_on"])}。</p>
+      <p>样品规则：{esc(batch["sample_rule"])}</p><p>按后台销量顺序记录的商品（{len(products)} 件）：</p><ol>{product_html}</ol>
+      <p>审核人：{esc(batch["reviewed_by"] or '待审核')}；审核时间：{esc(batch["reviewed_at"] or '-')}。</p></section>
+      {approve_form}{item_html}'''
+    return layout("定邀审核包", body)
+
+
+def update_targeted_invite_item(batch_id, item_id, action, data):
+    operator = (data.get("operator") or data.get("reviewer") or "").strip()[:120]
+    reference = (data.get("reference") or "").strip()[:500]
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        item = conn.execute(
+            """SELECT i.*, b.status AS batch_status, b.reviewed_at, b.ends_on
+               FROM targeted_invite_items i JOIN targeted_invite_batches b ON b.id=i.batch_id
+               WHERE i.id=? AND i.batch_id=?""", (item_id, batch_id)
+        ).fetchone()
+        if not item:
+            raise ValueError("审核包中的达人不存在")
+        if action == "review":
+            review_action = data.get("review_action")
+            draft = (data.get("draft_text") or "").strip()[:5000]
+            if item["batch_status"] != "draft":
+                raise ValueError("已审核批次的草稿不可覆盖；请建立新批次")
+            if not draft or not operator or review_action not in ("save", "approve"):
+                raise ValueError("请填写草稿、审核人和操作")
+            if review_action == "approve" and re.search(r"\[[^\]]+\]|\{[^}]+\}", draft):
+                raise ValueError("草稿仍有占位符，请先核对后再审核")
+            review_status = "approved" if review_action == "approve" else "pending"
+            reviewed_at = now_iso() if review_status == "approved" else None
+            conn.execute(
+                """UPDATE targeted_invite_items SET draft_text=?, review_status=?,
+                   reviewed_at=?, reviewed_by=? WHERE id=?""",
+                (draft, review_status, reviewed_at, operator, item_id),
+            )
+            targeted_invite_event(conn, item_id, "draft_approved" if review_status == "approved" else "draft_saved",
+                                  operator, note="人工核对站内邀约草稿")
+            return "草稿审核状态已保存；尚未发送邀约"
+        if action == "sent":
+            if item["batch_status"] != "reviewed" or item["review_status"] != "approved":
+                raise ValueError("批次和该达人草稿都必须先审核通过")
+            if item["sent_at"]:
+                raise ValueError("该达人已有实际发送记录，不能重复回填")
+            if date.fromisoformat(item["ends_on"]) < datetime.now().date():
+                raise ValueError("合作期限已过，请重新审核条件")
+            creator = conn.execute("SELECT * FROM creators WHERE id=?", (item["creator_id"],)).fetchone()
+            outcome, reasons = evaluate_candidate(dict(creator))
+            if outcome != "ready_for_review":
+                raise ValueError("发送前核验未通过：" + "；".join(reasons))
+            if data.get("confirmed") != "1" or not operator or not reference:
+                raise ValueError("请确认实际站内发送，并填写操作者与凭据")
+            sent_at = parse_sent_at(data.get("sent_at"))
+            if datetime.fromisoformat(sent_at) < datetime.fromisoformat(item["reviewed_at"]) - timedelta(minutes=1):
+                raise ValueError("实际发送时间不能早于批次审核")
+            conn.execute(
+                """UPDATE targeted_invite_items SET sent_at=?, sent_reference=?, sent_by=? WHERE id=?""",
+                (sent_at, reference, operator, item_id),
+            )
+            conn.execute(
+                """UPDATE creators SET outreach_status='sent', prior_invited_at=?,
+                   invite_history_checked=1, updated_at=? WHERE id=?""",
+                (sent_at[:10], now_iso(), item["creator_id"]),
+            )
+            targeted_invite_event(conn, item_id, "sent_in_tiktok_shop", operator, reference,
+                                  "操作者确认已在站内实际发送", sent_at)
+            return "实际发送已回填；草稿与发送分别留痕"
+        if action == "response":
+            status = data.get("response_status")
+            if not item["sent_at"] or status not in ("accepted", "replied", "rejected"):
+                raise ValueError("仅能为已实际发送的邀请记录接受、回复或拒绝")
+            if not operator or not reference:
+                raise ValueError("请填写核实人与结果凭据")
+            if item["response_status"] == status:
+                raise ValueError("该结果已记录，无需重复提交")
+            conn.execute("UPDATE targeted_invite_items SET response_status=? WHERE id=?", (status, item_id))
+            conn.execute(
+                "UPDATE creators SET outreach_status=?, updated_at=? WHERE id=?",
+                ("done" if status == "rejected" else "replied", now_iso(), item["creator_id"]),
+            )
+            targeted_invite_event(conn, item_id, "response_" + status, operator, reference)
+            return "站内结果已记录"
+        if action == "followup":
+            if not followup_due(item):
+                raise ValueError("只有实际发送满七天且仍无结果的邀请可记录跟进")
+            if not operator or not reference:
+                raise ValueError("请填写跟进操作者及实际操作凭据")
+            ts = now_iso()
+            conn.execute(
+                "UPDATE targeted_invite_items SET followed_up_at=?, followup_note=? WHERE id=?",
+                (ts, reference, item_id),
+            )
+            targeted_invite_event(conn, item_id, "followed_up", operator, reference, occurred_at=ts)
+            return "实际跟进已记录"
+        raise ValueError("未识别的审核包操作")
+
+
+def approve_targeted_invite_batch(batch_id, reviewer):
+    reviewer = (reviewer or "").strip()[:120]
+    if not reviewer:
+        raise ValueError("请填写批次审核人")
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = conn.execute("SELECT * FROM targeted_invite_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch or batch["status"] != "draft":
+            raise ValueError("批次不存在或已经审核")
+        if date.fromisoformat(batch["ends_on"]) < datetime.now().date():
+            raise ValueError("合作期限已过，请建立新的审核包")
+        rows = conn.execute(
+            """SELECT i.id, i.review_status, i.draft_text, c.*
+               FROM targeted_invite_items i JOIN creators c ON c.id=i.creator_id
+               WHERE i.batch_id=?""", (batch_id,)
+        ).fetchall()
+        if not rows or len(rows) > 50 or any(row["review_status"] != "approved" or not row["draft_text"] for row in rows):
+            raise ValueError("请先逐人核对并审核全部草稿")
+        for row in rows:
+            outcome, reasons = evaluate_candidate(dict(row))
+            if outcome != "ready_for_review":
+                raise ValueError(f"达人 #{row['id']} 核验已变化：{'；'.join(reasons)}")
+        ts = now_iso()
+        conn.execute(
+            "UPDATE targeted_invite_batches SET status='reviewed', reviewed_at=?, reviewed_by=? WHERE id=?",
+            (ts, reviewer, batch_id),
+        )
+        for row in rows:
+            targeted_invite_event(conn, row["id"], "batch_reviewed", reviewer,
+                                  note="商品、佣金、期限与样品规则已整体核对", occurred_at=ts)
+    return "审核包已通过；请在 TikTok Shop 人工发送并逐人回填"
+
+
 class App(BaseHTTPRequestHandler):
     def send_html(self, html_text, status=200, headers=None):
         body = html_text.encode("utf-8")
@@ -4680,6 +5334,13 @@ class App(BaseHTTPRequestHandler):
             return self.send_html(creators_page(query))
         if path == "/screening":
             return self.send_html(screening_page(query))
+        if path == "/targeted-screening":
+            return self.send_html(targeted_screening_page(query))
+        if path == "/targeted-invites":
+            return self.send_html(targeted_invites_page(query))
+        match = re.fullmatch(r"/targeted-invites/(\d+)", path)
+        if match:
+            return self.send_html(targeted_invite_batch_page(int(match.group(1)), query.get("flash", [""])[0]))
         match = re.fullmatch(r"/creators/(\d+)", path)
         if match:
             flash = query.get("flash", [""])[0]
@@ -4751,6 +5412,39 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/targeted-invites":
+            data = parse_post_multi(self)
+            try:
+                batch_id = create_targeted_invite_batch(data)
+            except ValueError as exc:
+                campaign_id = (data.get("campaign_id") or [""])[0]
+                return self.redirect("/targeted-screening?campaign_id=" + urllib.parse.quote(campaign_id) +
+                                     "&flash=" + urllib.parse.quote(str(exc)))
+            return self.redirect(f"/targeted-invites/{batch_id}?flash=" + urllib.parse.quote("审核包已建立，尚未发送"))
+        match = re.fullmatch(r"/targeted-invites/(\d+)/approve", path)
+        if match:
+            batch_id = int(match.group(1))
+            data = parse_post(self)
+            try:
+                message = approve_targeted_invite_batch(batch_id, data.get("reviewer"))
+            except ValueError as exc:
+                message = str(exc)
+            return self.redirect(f"/targeted-invites/{batch_id}?flash={urllib.parse.quote(message)}")
+        match = re.fullmatch(r"/targeted-invites/(\d+)/items/(\d+)/(review|sent|response|followup)", path)
+        if match:
+            batch_id, item_id, action = int(match.group(1)), int(match.group(2)), match.group(3)
+            data = parse_post(self)
+            try:
+                message = update_targeted_invite_item(batch_id, item_id, action, data)
+            except ValueError as exc:
+                message = str(exc)
+            return self.redirect(f"/targeted-invites/{batch_id}?flash={urllib.parse.quote(message)}")
+        if path in ("/targeted-screening/preview", "/targeted-screening/import"):
+            data = parse_post(self)
+            return targeted_screening_submit(self, data, save=path.endswith("/import"))
+        match = re.fullmatch(r"/targeted-screening/candidates/(\d+)", path)
+        if match:
+            return targeted_candidate_update(self, int(match.group(1)), parse_post(self))
         if path == "/screening/candidates":
             data = parse_post(self)
             name = (data.get("name") or "").strip()[:120]
@@ -4779,16 +5473,20 @@ class App(BaseHTTPRequestHandler):
             observed_at = (data.get("observed_at") or "").strip()
             if status == "verified" and (not evidence_url or not observed_at or followers is None or not country):
                 return self.redirect("/screening?flash=" + urllib.parse.quote("已核验需要国家、粉丝数、证据链接及观察日期"))
+            platform = data.get("platform") if data.get("platform") in PLATFORMS else "TikTok"
+            handle = normalize_handle(name if name.startswith("@") else "", profile_url) if platform == "TikTok" else ""
             with db() as conn:
-                existing = conn.execute(
+                existing = targeted_duplicate_ids(conn).get(handle) if handle else None
+                existing_url = conn.execute(
                     "SELECT id FROM creators WHERE campaign_id = ? AND profile_url = ?",
                     (campaign_id, profile_url),
                 ).fetchone() if profile_url else None
+                existing = existing or (existing_url["id"] if existing_url else None)
             if existing:
-                return self.redirect("/creators/" + str(existing["id"]) + "?flash=" + urllib.parse.quote("该主页已在项目中，请在此编辑"))
+                return self.redirect("/creators/" + str(existing) + "?flash=" + urllib.parse.quote("该账号已存在，请在此编辑"))
             creator_id = create_creator_for_campaign(
                 campaign_id, name, profile_url=profile_url,
-                platform=data.get("platform") if data.get("platform") in PLATFORMS else "TikTok",
+                platform=platform,
                 notes=(data.get("notes") or "")[:3000],
             )
             with db() as conn:
@@ -5022,22 +5720,30 @@ class App(BaseHTTPRequestHandler):
                 ok, result = create_creator_gmail_draft(creator_id)
                 flash = f"Gmail 草稿已创建：{result}" if ok else f"Gmail 草稿创建失败：{result}"
             elif action == "sent":
-                with db() as conn:
-                    conn.execute(
-                        "UPDATE creators SET outreach_status = 'sent', updated_at = ? WHERE id = ?",
-                        (now_iso(), creator_id),
-                    )
-                flash = "已标记发送"
+                if creator["handle_key"]:
+                    flash = "站内定邀需先保存审核包及实际发送记录；不能直接标记已发送"
+                else:
+                    with db() as conn:
+                        conn.execute(
+                            "UPDATE creators SET outreach_status = 'sent', updated_at = ? WHERE id = ?",
+                            (now_iso(), creator_id),
+                        )
+                    flash = "已标记发送"
             elif action == "done":
-                with db() as conn:
-                    conn.execute(
-                        "UPDATE creators SET outreach_status = 'done', updated_at = ? WHERE id = ?",
-                        (now_iso(), creator_id),
-                    )
-                flash = "已完成"
+                if creator["handle_key"]:
+                    flash = "站内定邀需有实际发送与后续状态记录，不能直接标记完成"
+                else:
+                    with db() as conn:
+                        conn.execute(
+                            "UPDATE creators SET outreach_status = 'done', updated_at = ? WHERE id = ?",
+                            (now_iso(), creator_id),
+                        )
+                    flash = "已完成"
             elif action and action.startswith("stage:"):
                 stage = action.split(":", 1)[1]
-                if stage not in LIFECYCLE_STAGES:
+                if creator["handle_key"] and stage in ("sent", "replied", "done"):
+                    flash = "站内定邀的发送及后续状态需由审核包和实际记录推进"
+                elif stage not in LIFECYCLE_STAGES:
                     flash = "未识别的达人阶段"
                 else:
                     with db() as conn:

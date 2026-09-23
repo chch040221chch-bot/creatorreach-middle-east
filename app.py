@@ -3403,6 +3403,10 @@ def gmail_page():
 
 
 SCREENING_COUNTRIES = {"SA": "沙特", "AE": "阿联酋", "OTHER": "其他", "": "未核验"}
+COUNTRY_SUGGESTIONS = {
+    "SA": "沙特", "AE": "阿联酋", "US": "美国", "GB": "英国",
+    "TH": "泰国", "ID": "印度尼西亚", "BR": "巴西", "IN": "印度",
+}
 SCREENING_STATUSES = {
     "unverified": "待核验",
     "verified": "已核验",
@@ -3419,8 +3423,30 @@ def parse_followers(value):
     return int(value)
 
 
+def parse_country(value, allow_all=False):
+    code = (value or "").strip().upper()
+    if allow_all and code in ("", "ALL"):
+        return "ALL"
+    if code in ("", "OTHER"):
+        return code
+    if re.fullmatch(r"[A-Z]{2}", code):
+        return code
+    raise ValueError("国家请填写两位英文字母代码，例如 SA、US、TH；留空表示未核验")
+
+
+def country_label(code):
+    return SCREENING_COUNTRIES.get(code or "", COUNTRY_SUGGESTIONS.get(code, code or "未核验"))
+
+
+def country_suggestions():
+    return "".join(
+        f'<option value="{esc(code)}">{esc(label)}</option>'
+        for code, label in COUNTRY_SUGGESTIONS.items()
+    )
+
+
 def screening_page(query):
-    country = query.get("country", ["SA"])[0]
+    country_input = query.get("country", ["ALL"])[0]
     platform = query.get("platform", [""])[0]
     minimum = query.get("min", ["100"])[0]
     maximum = query.get("max", ["1000"])[0]
@@ -3428,19 +3454,20 @@ def screening_page(query):
     verification = query.get("verification", ["verified"])[0]
     no_conflict = query.get("no_conflict", ["1"])[0] == "1"
     try:
+        country = parse_country(country_input, allow_all=True)
         min_followers = parse_followers(minimum)
         max_followers = parse_followers(maximum)
         if min_followers is not None and max_followers is not None and min_followers > max_followers:
             raise ValueError("最低粉丝数不能超过最高粉丝数")
         error = ""
     except ValueError as exc:
+        country = "ALL"
         min_followers = max_followers = None
         error = str(exc)
     where, params = [], []
-    if country in SCREENING_COUNTRIES:
-        if country:
-            where.append("c.country = ?")
-            params.append(country)
+    if country != "ALL":
+        where.append("COALESCE(c.country, '') = ?")
+        params.append(country)
     if platform in PLATFORMS:
         where.append("c.platform = ?")
         params.append(platform)
@@ -3468,9 +3495,7 @@ def screening_page(query):
         ).fetchall()
     campaigns = list_campaigns()
     campaign_options = "".join(option_html(row["id"], row["name"], "") for row in campaigns)
-    countries = option_html("ALL", "全部国家", country) + "".join(
-        option_html(code, name, country) for code, name in SCREENING_COUNTRIES.items()
-    )
+    countries = country_suggestions()
     platforms = option_html("", "全部平台", platform) + "".join(
         option_html(p, p, platform) for p in PLATFORMS
     )
@@ -3481,7 +3506,7 @@ def screening_page(query):
         f"""<tr>
         <td><a href="/creators/{row['id']}">{esc(row['name'])}</a></td>
         <td>{esc(row['platform'])}</td>
-        <td>{esc(SCREENING_COUNTRIES.get(row['country'] or '', '未核验'))} / {esc(row['city'] or '-')}</td>
+        <td>{esc(country_label(row['country']))} / {esc(row['city'] or '-')}</td>
         <td>{esc(row['followers'] if row['followers'] is not None else '未核验')}</td>
         <td>{esc(row['content_tags'] or '-')}</td>
         <td>{esc(SCREENING_STATUSES.get(row['screening_status'], '待核验'))}</td>
@@ -3494,11 +3519,11 @@ def screening_page(query):
     flash = query.get("flash", [""])[0]
     body = f"""
     <h1>达人筛选</h1>
-    <p class="page-kicker">基于已录入资料筛选；默认沙特、100–1,000 粉、已核验、排除竞品冲突。此页不抓取 TikTok，也不自动邀约。</p>
+    <p class="page-kicker">基于已录入资料筛选；第一轮测试默认全球、100–1,000 粉、已核验、排除竞品冲突。可按任意国家代码缩小范围。此页不抓取 TikTok，也不自动邀约。</p>
     {f'<div class="notice">{esc(error)}</div>' if error else ''}
     {f'<div class="notice ok">{esc(flash)}</div>' if flash else ''}
     <form class="panel filters" method="get" action="/screening">
-      <div><label>国家</label><select name="country">{countries}</select></div>
+      <div><label>国家（ALL = 全球）</label><input name="country" list="filter-country-codes" value="{esc(country_input)}" placeholder="ALL 或 SA / US / TH"><datalist id="filter-country-codes"><option value="ALL">全球</option><option value="OTHER">其他（旧数据）</option>{countries}</datalist></div>
       <div><label>平台</label><select name="platform">{platforms}</select></div>
       <div><label>最低粉丝数</label><input type="number" name="min" min="0" value="{esc(minimum)}"></div>
       <div><label>最高粉丝数</label><input type="number" name="max" min="0" value="{esc(maximum)}"></div>
@@ -3516,13 +3541,13 @@ def screening_page(query):
     </section>
     <form class="panel" method="post" action="/screening/candidates">
       <h2>录入一位候选达人</h2>
-      <p class="muted">没有核验资料时保留“待核验”；账号名称或阿语内容不等于沙特受众。</p>
+      <p class="muted">没有核验资料时保留“待核验”；内容语言、账号名称不能证明达人所在地或受众国家。</p>
       <div class="grid form-grid">
         <div><label>所属项目</label><select name="campaign_id">{campaign_options}</select></div>
         <div><label>账号/名称</label><input name="name" required></div>
         <div><label>主页 URL</label><input name="profile_url" type="url" placeholder="https://www.tiktok.com/@..."></div>
         <div><label>平台</label><select name="platform">{"".join(option_html(p, p, "TikTok") for p in PLATFORMS)}</select></div>
-        <div><label>国家（需证据）</label><select name="country">{"".join(option_html(code, name, "") for code, name in SCREENING_COUNTRIES.items())}</select></div>
+        <div><label>国家（两位代码，需证据）</label><input name="country" list="candidate-country-codes" maxlength="2" placeholder="SA / US / TH"><datalist id="candidate-country-codes">{countries}</datalist></div>
         <div><label>城市</label><input name="city"></div>
         <div><label>粉丝数</label><input type="number" name="followers" min="0"></div>
         <div><label>标签</label><input name="content_tags" placeholder="美妆, 眼妆"></div>
@@ -4198,7 +4223,7 @@ def creator_detail_page(creator_id, flash=""):
             <label>已核验的定制切入点</label>
             <textarea name="personalization_hook" placeholder="例如：主页在 2026-09-23 展示美妆与生活方式内容，并公开提供品牌合作入口。只填实际核验的公开信息。">{esc(creator["personalization_hook"] or "")}</textarea>
           </div>
-          <div><label>国家</label><select name="country">{"".join(option_html(code, name, creator["country"] or "") for code, name in SCREENING_COUNTRIES.items())}</select></div>
+          <div><label>国家（两位代码）</label><input name="country" list="profile-country-codes" maxlength="5" value="{esc(creator['country'] or '')}" placeholder="SA / US / TH"><datalist id="profile-country-codes">{country_suggestions()}<option value="OTHER">其他（旧数据）</option></datalist></div>
           <div><label>城市</label><input name="city" value="{esc(creator['city'] or '')}"></div>
           <div><label>粉丝数</label><input type="number" name="followers" min="0" value="{esc(creator['followers'] if creator['followers'] is not None else '')}"></div>
           <div><label>内容标签</label><input name="content_tags" value="{esc(creator['content_tags'] or '')}" placeholder="美妆, 眼妆"></div>
@@ -4252,6 +4277,14 @@ def campaigns_page(edit_id=None, flash=""):
     editing = load_campaign(edit_id) if edit_id else None
     notice = f'<div class="notice ok">{esc(flash)}</div>' if flash else ""
     templates = {
+        "global_creator_test": {
+            "label": "全球美妆达人小规模测试（不发送）",
+            "selling_points": "Internal test only. Build a small evidence-based beauty creator shortlist across countries. Do not assert product availability, approval, performance, or shipping eligibility in any market.",
+            "sample_policy": "No samples are offered during the test. Any future sample arrangement requires market-specific and manual confirmation.",
+            "commission_policy": "No fee, commission, discount code, affiliate terms, or usage rights are offered during the test. Discuss only after manual approval.",
+            "forbidden_promises": "Do not promise samples, shipping, pricing, commission, product registration, medical approval, product performance, or collaboration terms.",
+            "brand_tone": "Warm, respectful, concise. Draft for human review only; do not imply we have seen content that was not verified.",
+        },
         "saudi_colored_contacts": {
             "label": "沙特 / GCC 彩色隐形眼镜定向邀约",
             "selling_points": """Campaign purpose:
@@ -4737,7 +4770,10 @@ class App(BaseHTTPRequestHandler):
                 campaign_id = 0
             if not load_campaign(campaign_id):
                 return self.redirect("/screening?flash=" + urllib.parse.quote("请先建立项目"))
-            country = data.get("country") if data.get("country") in SCREENING_COUNTRIES else ""
+            try:
+                country = parse_country(data.get("country"))
+            except ValueError as exc:
+                return self.redirect("/screening?flash=" + urllib.parse.quote(str(exc)))
             status = data.get("screening_status") if data.get("screening_status") in SCREENING_STATUSES else "unverified"
             # A verified country and follower count need a dated, inspectable source.
             observed_at = (data.get("observed_at") or "").strip()
@@ -4889,7 +4925,10 @@ class App(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     flash = str(exc)
                     return self.redirect(f"{redirect_to}?flash={urllib.parse.quote(flash)}")
-                country = data.get("country") if data.get("country") in SCREENING_COUNTRIES else ""
+                try:
+                    country = parse_country(data.get("country"))
+                except ValueError as exc:
+                    return self.redirect(f"{redirect_to}?flash=" + urllib.parse.quote(str(exc)))
                 status = data.get("screening_status") if data.get("screening_status") in SCREENING_STATUSES else "unverified"
                 evidence_url = (data.get("evidence_url") or "").strip()[:1000]
                 observed_at = (data.get("observed_at") or "").strip()

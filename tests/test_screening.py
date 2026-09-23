@@ -76,11 +76,54 @@ class ScreeningTest(unittest.TestCase):
         })
         page = self.page("/screening")
         self.assertIn("@sa_beauty", page)
-        self.assertNotIn("@ae_beauty", page)
+        self.assertIn("@ae_beauty", page)
         self.assertNotIn("@unknown", page)
         self.assertNotIn("@competitor", page)
-        self.assertIn("筛选结果：1 条", page)
+        self.assertIn("筛选结果：2 条", page)
+        sa_page = self.page("/screening?country=SA")
+        self.assertIn("@sa_beauty", sa_page)
+        self.assertNotIn("@ae_beauty", sa_page)
         self.assertIn("@unknown", self.page("/screening?verification=unverified&min=&max=&country=ALL&no_conflict=0"))
+
+    def test_global_country_codes_and_profile_update(self):
+        for country, name, followers in (("us", "@us_makeup", "300"), ("th", "@th_makeup", "950")):
+            self.post({
+                "campaign_id": self.campaign_id, "name": name,
+                "profile_url": f"https://www.tiktok.com/{name}",
+                "country": country, "followers": followers,
+                "screening_status": "verified", "evidence_url": f"https://example.com/{country}",
+                "observed_at": "2026-09-23",
+            })
+        page = self.page("/screening")
+        self.assertIn("@us_makeup", page)
+        self.assertIn("@th_makeup", page)
+        self.assertIn("筛选结果：2 条", page)
+        self.assertIn("US", page)
+        us_page = self.page("/screening?country=us")
+        self.assertIn("@us_makeup", us_page)
+        self.assertNotIn("@th_makeup", us_page)
+        with app.db() as conn:
+            creator = conn.execute("SELECT id, country FROM creators WHERE name = '@us_makeup'").fetchone()
+            self.assertEqual("US", creator["country"])
+        body = urllib.parse.urlencode({
+            "action": "save_profile", "name": "@us_makeup", "country": "br",
+            "followers": "300", "screening_status": "verified",
+            "evidence_url": "https://example.com/br", "observed_at": "2026-09-23",
+        }).encode("utf-8")
+        urllib.request.urlopen(self.base + f"/creators/{creator['id']}/action", data=body).read()
+        with app.db() as conn:
+            self.assertEqual("BR", conn.execute(
+                "SELECT country FROM creators WHERE id = ?", (creator["id"],)
+            ).fetchone()["country"])
+        self.assertIn("@us_makeup", self.page("/screening?country=BR"))
+
+    def test_invalid_country_does_not_create_creator(self):
+        page = self.post({
+            "campaign_id": self.campaign_id, "name": "@invalid_country",
+            "country": "Mars", "followers": "200",
+        })
+        self.assertIn("国家请填写两位英文字母代码", page)
+        self.assertEqual(0, len(self._creators()))
 
     def test_verified_requires_evidence_and_prevents_duplicate(self):
         invalid = self.post({

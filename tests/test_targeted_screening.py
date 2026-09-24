@@ -87,6 +87,17 @@ class TargetedScreeningTest(unittest.TestCase):
         self.assertIn("待人工审核", page)
         self.assertNotIn("已发送邀约", page)
 
+    def test_candidate_queue_filters_by_status_and_handle(self):
+        batch = "账号\t粉丝\t成交件数\t平均播放\t统计天数\n@beauty.pending\t5000\t150\t500\t30\n@beauty.excluded\t500\t150\t500\t30"
+        self.post("/targeted-screening/import", {"campaign_id": self.campaign_id, "candidates": batch})
+        query = urllib.parse.urlencode({"campaign_id": self.campaign_id, "status": "excluded", "q": "beauty"})
+        page = urllib.request.urlopen(self.base + f"/targeted-screening?{query}").read().decode("utf-8")
+        self.assertIn("已录入候选（当前显示 1 / 共 2）", page)
+        self.assertIn("beauty.excluded</a>", page)
+        self.assertNotIn("beauty.pending</a>", page)
+        self.assertIn("粉丝不在", page)
+        self.assertIn("核验状态", page)
+
     def test_parser_rejects_ambiguous_rows_and_score_requires_same_window(self):
         rows, errors = app.parse_candidates("| 账号 | 粉丝 | 成交件数 | 平均播放 | 统计天数 |\n|---|---|---|---|---|\n| @m | 1万 | 100 | 120 | 30 |")
         self.assertEqual(len(rows), 0)

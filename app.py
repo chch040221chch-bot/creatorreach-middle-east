@@ -812,6 +812,7 @@ def layout(title, body, extra_head=""):
     }}
     .page-head .button.secondary {{ background: #ffffff; }}
     .page-kicker {{ color: #e8dec5; margin: 8px 0 0; max-width: 760px; }}
+    .page-head .page-kicker a {{ color: #ffffff; text-decoration: underline; }}
     h1 {{ margin: 0; font-size: 34px; line-height: 1.08; letter-spacing: 0; font-weight: 950; }}
     h2 {{ margin: 0 0 14px; font-size: 20px; letter-spacing: 0; font-weight: 900; }}
     .panel {{
@@ -860,6 +861,23 @@ def layout(title, body, extra_head=""):
     }}
     .stat strong {{ display: block; font-size: 34px; line-height: 1.05; font-weight: 950; }}
     .stat span {{ color: var(--muted); font-size: 14px; font-weight: 750; }}
+    .workflow-steps {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 20px; }}
+    .workflow-step {{ padding: 9px 13px; border: 1px solid #eadfbd; border-radius: 999px; background: #fffdf7; font-size: 13px; font-weight: 800; }}
+    .workflow-step.current {{ background: var(--brand); border-color: #e6bf00; }}
+    .screening-filters {{ display: grid; grid-template-columns: minmax(180px, 1fr) minmax(160px, 220px) auto; gap: 12px; align-items: end; }}
+    .screening-filters label {{ margin: 0; }}
+    .screening-filters .actions {{ margin: 0; }}
+    .screening-table {{ width: 100%; overflow-x: auto; }}
+    .screening-table table {{ min-width: 1120px; }}
+    .screening-table td {{ font-size: 13px; }}
+    .screening-table .reason-cell {{ min-width: 230px; max-width: 320px; white-space: normal; line-height: 1.45; }}
+    #candidate-list, #candidate-import, #review-panel {{ scroll-margin-top: 94px; }}
+    .review-section-title {{ margin: 20px 0 12px; padding-bottom: 8px; border-bottom: 1px solid #eadfbd; font-size: 16px; font-weight: 900; }}
+    .invite-item {{ border-left: 6px solid #eadfbd; }}
+    .invite-item.reviewed {{ border-left-color: #e6bf00; }}
+    .invite-item.sent {{ border-left-color: #168c81; }}
+    .invite-item .item-head {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; }}
+    .invite-item .item-head h3 {{ margin: 0; }}
     label {{ display: block; font-weight: 750; margin-bottom: 7px; }}
     input, select, textarea {{
       width: 100%;
@@ -1353,7 +1371,7 @@ def layout(title, body, extra_head=""):
       .top-actions {{ justify-content: flex-start; flex-wrap: wrap; }}
       .category-nav {{ white-space: nowrap; }}
       .wrap {{ padding: 18px; }}
-      .stats, .form-grid, .two, .three, .filters, .overview-grid, .project-brief-grid {{ grid-template-columns: 1fr; }}
+      .stats, .form-grid, .two, .three, .filters, .overview-grid, .project-brief-grid, .screening-filters {{ grid-template-columns: 1fr; }}
       .creator-progress-card {{ grid-template-columns: 1fr; }}
       .creator-progress-actions {{ justify-items: start; }}
       .creator-progress-actions .row-actions {{ justify-content: flex-start; flex-wrap: wrap; }}
@@ -1391,11 +1409,11 @@ def layout(title, body, extra_head=""):
 
 def badge(value):
     cls = ""
-    if value in ("ai_failed", "rejected", "invalid", "error", "failed", "completed_with_errors", "draft_failed", "P0 异常", "Gmail 异常", "有异常"):
+    if value in ("ai_failed", "rejected", "invalid", "error", "failed", "completed_with_errors", "draft_failed", "P0 异常", "Gmail 异常", "有异常", "排除"):
         cls = " bad"
-    elif value in ("ask_price", "ask_sample", "needs_human", "missing", "先补邮箱", "先生成邮件", "生成中", "skipped", "running", "generating", "P3 观察", "P4 补资料", "待首次触达", "首封待确认", "首次触达", "已首次触达", "首次回复", "沟通环节", "寄样品", "拍摄环节", "未创建"):
+    elif value in ("ask_price", "ask_sample", "needs_human", "missing", "先补邮箱", "先生成邮件", "生成中", "skipped", "running", "generating", "P3 观察", "P4 补资料", "待首次触达", "首封待确认", "首次触达", "已首次触达", "首次回复", "沟通环节", "寄样品", "拍摄环节", "未创建", "待核验", "草稿待审核", "草稿已审，待站内操作"):
         cls = " warn"
-    elif value in ("done", "sent", "posted", "interested", "draft_ready", "gmail_drafted", "drafted", "已有 Gmail 草稿", "success", "completed", "P1 优先", "P2 推荐", "项目结束", "已进草稿箱", "正常"):
+    elif value in ("done", "sent", "posted", "interested", "draft_ready", "gmail_drafted", "drafted", "已有 Gmail 草稿", "success", "completed", "P1 优先", "P2 推荐", "项目结束", "已进草稿箱", "正常", "待人工审核", "草稿已审", "已回填发送"):
         cls = " good"
     return f'<span class="badge{cls}">{esc(value or "-")}</span>'
 
@@ -4804,6 +4822,16 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         listing.append((0 if outcome == "ready_for_review" else 1 if outcome == "pending" else 2,
                         -(score if score is not None else -1), item, outcome, reasons, score))
     listing.sort(key=lambda x: (x[0], x[1], x[2]["id"]))
+    status_counts = {status: sum(row[3] == status for row in listing)
+                     for status in ("ready_for_review", "pending", "excluded")}
+    selected_status = query.get("status", [""])[0]
+    if selected_status not in ("", "ready_for_review", "pending", "excluded"):
+        selected_status = ""
+    search = query.get("q", [""])[0].strip()[:80]
+    if selected_status:
+        listing = [row for row in listing if row[3] == selected_status]
+    if search:
+        listing = [row for row in listing if search.casefold() in row[2]["handle_key"].casefold()]
     requested_page = query.get("page", ["1"])[0]
     page_number = int(requested_page) if requested_page.isdigit() else 1
     page_count = max(1, (len(listing) + 99) // 100)
@@ -4817,8 +4845,8 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         f'<td>{item["avg_views"] if item["avg_views"] is not None else "-"}</td>'
         f'<td>{item["metrics_window_days"] if item["metrics_window_days"] is not None else "-"} 天</td>'
         f'<td>{score if score is not None else "-"}</td><td>{esc(item.get("source_country") or item.get("country") or "-")}</td>'
-        f'<td>{esc(item.get("source_ref") or "-")}</td><td>{labels[outcome]}</td>'
-        f'<td>{esc("；".join(reasons))}</td><td><a href="/targeted-screening?campaign_id={campaign_id}&page={page_number}&edit={item["id"]}">核验</a></td></tr>'
+        f'<td>{esc(item.get("source_ref") or "-")}</td><td>{badge(labels[outcome])}</td>'
+        f'<td class="reason-cell">{esc("；".join(reasons))}</td><td><a class="button secondary" href="/targeted-screening?{urllib.parse.urlencode({"campaign_id": campaign_id, "page": page_number, "status": selected_status, "q": search, "edit": item["id"]})}#review-panel">核验</a></td></tr>'
         for _, _, item, outcome, reasons, score in visible_listing
     ) or '<tr><td colspan="11">暂无站内定邀候选。先粘贴表格预览。</td></tr>'
     edit_id = query.get("edit", [""])[0]
@@ -4830,12 +4858,12 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         def select(key, choices):
             current = edit_item.get(key) or "unknown"
             return "".join(f'<option value="{v}"{" selected" if current == v else ""}>{label}</option>' for v, label in choices)
-        edit_html = f'''<form class="panel" method="post" action="/targeted-screening/candidates/{edit_item["id"]}">
+        edit_html = f'''<form class="panel" id="review-panel" method="post" action="/targeted-screening/candidates/{edit_item["id"]}">
           <h2>核验 @{val("handle_key")}</h2>
           <p>仅填写已实际核实的事实；未核实保持“未知”。</p>
           <p>数据来源：{val("metric_source") or '-'}；播放口径：{val("view_metric_type") or '-'}；来源国家/地区：{val("source_country") or '-'}。28 天代理数据必须人工核验后才能进入审核包。</p>
           <input type="hidden" name="campaign_id" value="{campaign_id}">
-          <div class="grid form-grid">
+          <div class="review-section-title">账号与数据依据</div><div class="grid form-grid">
             <label>主页 URL<input name="profile_url" value="{val("profile_url")}"></label>
             <label>后台数据证据 URL<input name="evidence_url" value="{val("evidence_url")}"></label>
             <label>来源截图编号 / 文件名<input name="source_ref" value="{val("source_ref")}"></label>
@@ -4847,6 +4875,7 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
             <label>平均播放<input name="avg_views" type="number" min="0" value="{val("avg_views")}"></label>
             <label>统计天数<input name="metrics_window_days" type="number" min="1" value="{val("metrics_window_days")}"{' readonly' if edit_item.get('metric_source') == 'FastMoss' else ''}></label>
             <label>28 天代理口径核验<select name="metrics_review_status">{select("metrics_review_status", [("unknown","待核验"),("accepted_28d","已核验并接受 28 天代理")])}</select></label>
+          </div><div class="review-section-title">历史邀约与适配核验</div><div class="grid form-grid">
             <label>上次邀约日期 YYYY-MM-DD<input name="prior_invited_at" value="{val("prior_invited_at")}"></label>
             <label>历史邀约核查<select name="invite_history_checked"><option value="0">未核查</option><option value="1"{" selected" if edit_item["invite_history_checked"] else ""}>已核查</option></select></label>
             <label>黑名单<select name="blacklist_status">{select("blacklist_status", [("unknown","未知"),("no","未命中"),("yes","命中")])}</select></label>
@@ -4865,10 +4894,25 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
     start_default = datetime.now().date().isoformat()
     end_default = (datetime.now().date() + timedelta(days=365)).isoformat()
     page_links = "".join(
-        f'<a class="button secondary" href="/targeted-screening?campaign_id={campaign_id}&page={target}">{label}</a>'
+        f'<a class="button secondary" href="/targeted-screening?{urllib.parse.urlencode({"campaign_id": campaign_id, "page": target, "status": selected_status, "q": search})}#candidate-list">{label}</a>'
         for target, label in ((page_number - 1, "上一页"), (page_number + 1, "下一页"))
         if 1 <= target <= page_count
     )
+    filter_options = "".join(option_html(value, label, selected_status) for value, label in (
+        ("", "全部状态"), ("ready_for_review", "待人工审核"),
+        ("pending", "待核验"), ("excluded", "已排除")))
+    filter_form = f'''<form class="screening-filters" method="get" action="/targeted-screening">
+      <input type="hidden" name="campaign_id" value="{campaign_id}">
+      <label>查找 TikTok 账号<input name="q" value="{esc(search)}" placeholder="输入账号关键词"></label>
+      <label>核验状态<select name="status">{filter_options}</select></label>
+      <div class="actions"><button type="submit">筛选</button><a class="button secondary" href="/targeted-screening?campaign_id={campaign_id}#candidate-list">清除</a></div>
+    </form>'''
+    summary_html = f'''<div class="grid stats" aria-label="候选状态概览">
+      <div class="stat"><strong>{len(candidate_rows)}</strong><span>已录入候选</span></div>
+      <div class="stat"><strong>{status_counts["pending"]}</strong><span>待补证据</span></div>
+      <div class="stat"><strong>{status_counts["ready_for_review"]}</strong><span>待人工审核</span></div>
+      <div class="stat"><strong>{status_counts["excluded"]}</strong><span>已排除</span></div>
+    </div>'''
     batch_form = f'''<form class="panel" method="post" action="/targeted-invites">
       <h2>建立发送前审核包</h2><p>仅可选择已完成核验的候选；每批最多 50 人。商品按后台销量顺序填写，最多 15 件。此操作只保存审核包。</p>
       <input type="hidden" name="campaign_id" value="{campaign_id}">
@@ -4881,9 +4925,19 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         <label>结束日期<input type="date" name="ends_on" value="{end_default}" required></label>
       </div><button type="submit">创建待审核批次</button>
     </form>''' if campaign_id else ""
-    body = f'''<div class="page-heading"><div><h1>站内定邀候选</h1>
+    body = f'''<div class="page-head"><div><h1>站内定邀候选</h1>
       <p class="page-kicker">粉丝 1,000–100,000、成交 ≥100 件、平均播放 ≥100。28 天与 30 天数据分别排序；FastMoss 的 28 天代理口径须人工核验。</p></div></div>
-      {notice}
+      <div class="workflow-steps" aria-label="定向邀约流程"><span class="workflow-step current">1 导入与初筛</span><span class="workflow-step">2 人工核验</span><span class="workflow-step">3 审核包</span><span class="workflow-step">4 站内发送回填</span></div>
+      {summary_html}{notice}
+      <div class="actions"><a class="button secondary" href="#candidate-list">查看候选</a><a class="button secondary" href="#candidate-import">录入新候选</a></div>
+      <section class="panel" id="candidate-list"><h2>已录入候选（当前显示 {len(listing)} / 共 {len(candidate_rows)}）</h2>
+        <p>待人工审核不代表可以发送。核验内容质量、受众和商业适配后，仍须在 TikTok Shop 完成实际邀请。</p>
+        {filter_form}
+        <p>第 {page_number} / {page_count} 页；每页最多 100 人。相对分仅在相同统计周期内比较。</p>
+        <div class="screening-table"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>周期</th><th>相对分</th><th>来源国家</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></div>
+        <div class="actions">{page_links}</div>
+      </section>{edit_html}{batch_form}
+      <div id="candidate-import" class="review-section-title">录入新候选</div>
       <form class="panel" method="post" action="/targeted-screening/xlsx-preview" enctype="multipart/form-data">
         <h2>预览 FastMoss Excel</h2><p>读取 .xlsx 中的近 28 天销量和带货视频平均播放量。预览不写入数据库；导入后仍需人工核验 28 天代理口径、内容、受众及邀约历史。</p>
         <div class="grid form-grid">
@@ -4897,13 +4951,7 @@ def targeted_screening_page(query=None, preview=None, pasted_text=""):
         <label>项目<select name="campaign_id" required>{campaign_options}</select></label>
         <label>候选表<textarea name="candidates" rows="8" placeholder="账号&#9;粉丝&#9;成交件数&#9;平均播放&#9;统计天数\nexample.creator&#9;1.2万&#9;230&#9;3500&#9;30">{esc(pasted_text)}</textarea></label>
         <button type="submit">预览候选</button>
-      </form>{preview_html}
-      <section class="panel"><h2>已录入候选（{len(listing)}）</h2>
-        <p>待人工审核不代表可以发送。核验内容质量、受众和商业适配后，仍须在 TikTok Shop 完成实际邀请。</p>
-        <p>第 {page_number} / {page_count} 页；每页最多 100 人。相对分仅在相同统计周期内比较。</p>
-        <div style="overflow-x:auto"><table><thead><tr><th>账号</th><th>粉丝</th><th>成交件数</th><th>平均播放</th><th>周期</th><th>相对分</th><th>来源国家</th><th>来源截图</th><th>结果</th><th>原因 / 缺失证据</th><th>操作</th></tr></thead><tbody>{rows_html}</tbody></table></div>
-        <div class="actions">{page_links}</div>
-      </section>{batch_form}{edit_html}'''
+      </form>{preview_html}'''
     return layout("站内定邀", body)
 
 
@@ -5250,6 +5298,9 @@ def targeted_invites_page(query=None):
             "SELECT id, sent_at, response_status, followed_up_at FROM targeted_invite_items WHERE sent_at IS NOT NULL"
         ).fetchall()
     due_count = sum(followup_due(item) for item in sent_items)
+    total_items = sum(row["item_count"] for row in batches)
+    approved_items = sum(row["approved_count"] or 0 for row in batches)
+    sent_count = sum(row["sent_count"] or 0 for row in batches)
     batch_rows = "".join(
         f'<tr><td><a href="/targeted-invites/{row["id"]}">批次 #{row["id"]}</a></td>'
         f'<td>{esc(row["campaign_name"])}</td><td>{esc(row["status"])}</td>'
@@ -5270,9 +5321,16 @@ def targeted_invites_page(query=None):
             f'（实际邀请：{esc(item["sent_at"]) }）</li>'
             for item in due_items if followup_due(item)
         )
-    body = f'''<div class="page-heading"><div><h1>定邀审核包</h1>
+    body = f'''<div class="page-head"><div><h1>定邀审核包</h1>
        <p class="page-kicker">审核条件、人工站内发送和后续状态分开记录。此页面不会调用 TikTok Shop API。</p></div></div>
+       <div class="workflow-steps" aria-label="定向邀约流程"><span class="workflow-step">1 导入与初筛</span><span class="workflow-step">2 人工核验</span><span class="workflow-step current">3 审核包</span><span class="workflow-step">4 站内发送回填</span></div>
        {f'<div class="notice">{esc(flash)}</div>' if flash else ''}
+       <div class="grid stats" aria-label="审核包进度">
+         <div class="stat"><strong>{total_items}</strong><span>审核包内候选</span></div>
+         <div class="stat"><strong>{approved_items}</strong><span>已审草稿</span></div>
+         <div class="stat"><strong>{sent_count}</strong><span>已回填实际发送</span></div>
+         <div class="stat"><strong>{due_count}</strong><span>七天待跟进</span></div>
+       </div>
        <section class="panel"><h2>七天待跟进：{due_count} 人</h2>
        <p>只按实际发送时间和仍未收到结果的状态计算。</p><ul>{due_rows or '<li>当前没有到期项。</li>'}</ul></section>
        <section class="panel"><h2>审核批次</h2><div style="overflow-x:auto"><table>
@@ -5342,7 +5400,9 @@ def targeted_invite_batch_page(batch_id, flash=""):
                   <label>跟进操作者<input name="operator" required></label>
                   <label>实际跟进凭据或备注<input name="reference" required></label>
                   <button type="submit">记录已跟进</button></form>'''
-        item_html += f'''<section class="panel"><h3>@{esc(item["handle_key"] or item["creator_name"])}</h3>
+        item_state = "sent" if item["sent_at"] else "reviewed" if item["review_status"] == "approved" else ""
+        state_label = "已回填发送" if item["sent_at"] else "草稿已审，待站内操作" if batch["status"] == "reviewed" else "草稿已审" if item["review_status"] == "approved" else "草稿待审核"
+        item_html += f'''<section class="panel invite-item {item_state}"><div class="item-head"><h3>@{esc(item["handle_key"] or item["creator_name"])}</h3>{badge(state_label)}</div>
           <p><strong>入选快照：</strong>粉丝 {esc(candidate_snapshot.get("followers", "-"))} · 成交 {esc(candidate_snapshot.get("units_sold", "-"))} · 平均播放 {esc(candidate_snapshot.get("avg_views", "-"))} · 相对分 {esc(candidate_snapshot.get("relative_score", "-"))} · 统计 {esc(candidate_snapshot.get("metrics_window_days", "-"))} 天 · 观察 {esc(candidate_snapshot.get("observed_at", "-"))} · 来源 {esc(candidate_snapshot.get("source_ref", "-"))}</p>
           <p><strong>入选切入点：</strong>{esc(item["hook_snapshot"])}</p>
           <p><strong>内容证据：</strong>{esc(item["content_url_snapshot"])}</p>
@@ -5354,9 +5414,11 @@ def targeted_invite_batch_page(batch_id, flash=""):
        <h2>批次审核</h2><p>确认商品、佣金、期限、样品规则及每人的个性化草稿。审核后条件与草稿锁定。</p>
        <label>审核人<input name="reviewer" required></label>
        <button type="submit" {'' if approved else 'disabled'}>审核通过，生成站内操作清单</button></form>''' if batch["status"] == "draft" else ""
-    body = f'''<div class="page-heading"><div><h1>定邀审核包 #{batch_id}</h1>
+    body = f'''<div class="page-head"><div><h1>定邀审核包 #{batch_id}</h1>
       <p class="page-kicker"><a href="/targeted-invites">返回审核包</a> · {esc(batch["campaign_name"])} · {esc(batch["status"])}</p></div></div>
+      <div class="workflow-steps" aria-label="定向邀约流程"><span class="workflow-step">1 导入与初筛</span><span class="workflow-step">2 人工核验</span><span class="workflow-step current">3 审核包</span><span class="workflow-step">4 站内发送回填</span></div>
       {f'<div class="notice">{esc(flash)}</div>' if flash else ''}
+      <div class="notice">本页仅整理审核与回填记录。草稿通过后，操作者仍须在 TikTok Shop 完成每条邀请，再记录实际发送时间和凭据。</div>
       <section class="panel"><h2>冻结的邀约条件</h2><p>佣金：{batch["commission_percent"]}%；期限：{esc(batch["starts_on"])} 至 {esc(batch["ends_on"])}。</p>
       <p>样品规则：{esc(batch["sample_rule"])}</p><p>按后台销量顺序记录的商品（{len(products)} 件）：</p><ol>{product_html}</ol>
       <p>审核人：{esc(batch["reviewed_by"] or '待审核')}；审核时间：{esc(batch["reviewed_at"] or '-')}。</p></section>

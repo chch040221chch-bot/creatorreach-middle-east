@@ -1,4 +1,4 @@
-# CreatorReach Middle East - 
+# CreatorReach 
 
 > 这是基于 CreatorReach AI 的本地改造版，面向沙特、UAE 与 GCC 的美妆、生活方式和眼妆达人定向邀约。
 >
